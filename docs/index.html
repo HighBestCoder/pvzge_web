@@ -35,6 +35,7 @@
   <!--<link rel="apple-touch-icon-precomposed" href=".png" />-->
 
   <link rel="stylesheet" type="text/css" href="style.css" />
+  <link rel="stylesheet" type="text/css" href="learning/quiz.css" />
 
   <script>
     (function () {
@@ -105,8 +106,31 @@
   <script src="src/import-map.json" type="systemjs-importmap" charset="utf-8"> </script>
 
   <script>
+    (function () {
+      const blockedEvents = ['keydown', 'keyup', 'keypress', 'pointerdown', 'pointerup', 'pointermove', 'mousedown', 'mouseup', 'click', 'touchstart', 'touchend', 'wheel', 'contextmenu'];
+      const quizKeys = new Set();
+      function guardQuizInput(event) {
+        const dialog = document.getElementById('addition-quiz');
+        if (event.type === 'keydown' && dialog?.open) quizKeys.add(event.code);
+        if (event.type === 'keyup' && quizKeys.delete(event.code) && !dialog?.open) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          return;
+        }
+        if (!dialog || !dialog.open || (event.target instanceof Node && dialog.contains(event.target))) return;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      }
+      blockedEvents.forEach(function (type) {
+        window.addEventListener(type, guardQuizInput, { capture: true, passive: false });
+      });
+    })();
+  </script>
+
+  <script>
     System.import('./index.js').catch(function (err) { console.error(err); })
   </script>
+  <script type="module" src="learning/bootstrap.js"></script>
   <script src="tmpPatch.js"></script>
 </body>
 
