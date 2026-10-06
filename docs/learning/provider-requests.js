@@ -33,6 +33,17 @@ function string(value, path) {
   return value;
 }
 
+function enteredValues(value) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 2) {
+    invalid("response.values", "must contain 1 or 2 fields");
+  }
+  return value.map((item, index) => {
+    const result = string(item, `response.values[${index}]`);
+    if (result.length > 16) invalid(`response.values[${index}]`, "must be at most 16 characters");
+    return result;
+  });
+}
+
 function elapsed(value) {
   if (!Number.isSafeInteger(value) || value < 0) invalid("response.elapsedMs", "must be a safe integer >= 0");
   return value;
@@ -50,7 +61,7 @@ function base(input, keys) {
 }
 
 export function parseCreateSessionRequest(input) {
-  const { value, schemaVersion } = base(input, ["requestId", "gameSessionId", "gameContext"]);
+  const { value, schemaVersion } = base(input, ["requestId", "gameSessionId", "saveId", "gameContext"]);
   const context = object(value.gameContext, "gameContext");
   exactKeys(context, ["gameId", "levelIds", "locale"], "gameContext");
   if (!Array.isArray(context.levelIds)) invalid("gameContext.levelIds", "must be an array");
@@ -58,6 +69,7 @@ export function parseCreateSessionRequest(input) {
     schemaVersion,
     requestId: string(value.requestId, "requestId"),
     gameSessionId: string(value.gameSessionId, "gameSessionId"),
+    ...(value.saveId === undefined ? {} : { saveId: positiveSafeInteger(value.saveId, "saveId") }),
     gameContext: {
       gameId: literal(context.gameId, "pvzge", "gameContext.gameId"),
       levelIds: context.levelIds.map((item, index) => string(item, `gameContext.levelIds[${index}]`)),
@@ -84,12 +96,14 @@ export function parseEndSessionRequest(input) {
 export function parseSubmitAnswerRequest(input) {
   const { value, schemaVersion } = base(input, ["sessionId", "taskId", "questionId", "questionVersion", "attemptId", "response"]);
   const response = object(value.response, "response");
-  const type = oneOf(response.type, ["answered", "timed_out", "skipped", "cancelled"], "response.type");
+  const type = oneOf(response.type, ["answered", "entered", "timed_out", "skipped", "cancelled"], "response.type");
   const keys = type === "answered" ? ["type", "optionId", "elapsedMs"] : type === "cancelled"
-    ? ["type", "reason", "elapsedMs"] : ["type", "elapsedMs"];
+    ? ["type", "reason", "elapsedMs"] : type === "entered"
+      ? ["type", "values", "elapsedMs"] : ["type", "elapsedMs"];
   exactKeys(response, keys, "response");
   const parsedResponse = { type };
   if (type === "answered") parsedResponse.optionId = string(response.optionId, "response.optionId");
+  if (type === "entered") parsedResponse.values = enteredValues(response.values);
   if (type === "cancelled") parsedResponse.reason = oneOf(response.reason, CANCEL_REASONS, "response.reason");
   parsedResponse.elapsedMs = elapsed(response.elapsedMs);
   return {
