@@ -1,160 +1,81 @@
-# PvZ 学习 Provider API（schemaVersion 1）
+# PvZ 学习与存档 API 集成
 
-本模块把游戏编排与学习服务隔离。游戏控制器只依赖四个异步方法；`bootstrap.js` 是唯一选择题源和配置演示学习者的组合入口，当前注入 `createLocalLearningProvider`。将来可用相同 DTO 实现远程 provider，不需要修改题目渲染和游戏奖励逻辑。
+儿童应用独立运行在 `http://localhost:8080/`，默认使用同源 `/api` 的真实学习平台。
+根页面是免密码的儿童/存档选择器；选择成功后仅把服务端返回的 `{token, account, save}`
+写入 `sessionStorage["pvz.play.selection"]`，并在同一标签页进入
+`/game/?saveId=<正整数>`。家长管理应用独立运行在 `http://localhost:8081/`；游戏忽略家长
+cookie，家长退出也不影响已选中的儿童标签页。仅显式 `?demo=1` 使用内存本地 provider，
+不调用任何 API；网络、认证或配置错误绝不会静默回退演示题。
 
-```js
-const provider = createLocalLearningProvider({
-  learnerRef: "demo-learner",
-  random: Math.random,
-  id: () => crypto.randomUUID(),
-});
+完整服务端契约以 `../learning-platform/API.md` 为准。本目录只实现游戏侧适配。
 
-await provider.createSession(request, { signal });
-await provider.getNextTask(request, { signal });
-await provider.submitAnswer(request, { signal });
-await provider.endSession(request, { signal });
-```
+## 启动门与存档隔离
 
-构造参数均可省略。`learnerRef` 是本地演示配置，不允许客户端在请求中提交 `learnerId`；未来后端必须从认证身份推导学习者。所有方法立即检查已经 aborted 的 `AbortSignal` 并抛出 `AbortError`。这只表示客户端操作中止，不是 `cancelled` 学习结果；如需记录取消，仍须用相同身份字段调用 `submitAnswer`。
+`bootstrap.js` 在导入 Cocos 引擎前依次确认：
 
-## DTO 与校验边界
+1. URL 中存在合法 `saveId`（演示模式除外）；
+2. sessionStorage selection 含合法 token/account/save，且 URL `saveId` 与 selection.save.id 一致；
+3. 携带 `Authorization: Bearer <token>` 的 `GET /api/play/context` 返回同一 account/save；
+4. 携带同一 bearer 的 `GET /api/saves/{saveId}/game-state` 返回合法的两键状态。
 
-所有请求和响应都有 `schemaVersion: 1`。`docs/learning/provider.js` 导出：
+缺失、无效、过期或身份不匹配的 selection 会返回 `/` 存档选择器，不跳转登录页；身份
+不匹配时只删除 `pvz.play.selection`。网络失败保留 selection 并显示重试，不加载引擎。
+页面绑定的 token/account/save 在生命周期内不可改变；新选择只影响当前标签页。运行期间
+任一 API 返回 401 会统一触发 `play:authorization-required`，停止关卡入口和原生状态同步，
+仅当 sessionStorage 仍是失败请求捕获的旧 token 时才清除 selection，然后返回选择器。
 
-- `LearningProviderError(code, message)`：协议、引用和幂等冲突的类型化错误。
-- `parseSession(value)`、`parseTask(value)`、`parseTaskResponse(value)`、`parseSubmissionResult(value)`：供远程 adapter 或通用父级 view 校验不可信公开 payload；函数重建白名单对象并深复制数组，不透传额外字段。
+原生 Cocos 仍访问 `window.localStorage`，但仅当 `this === window.localStorage` 且 key
+为 `PvZ2_PlayerProperties` 或 `PvZ2_Settings` 时映射到
+`pvzge:native:<accountId>:<saveId>:<key>`。其他 key、其他 Storage 实例和旧的未加前缀
+值保持不变；不会自动迁移或删除旧值。玩家数组必须是 JSON array，设置必须是 JSON
+object。同步 PUT 总是携带两键和基础 revision；本地未同步值先进入持久 outbox。若 PUT
+已在服务端提交但响应丢失，客户端在传输失败、CAS 409 或 reload 时读取最新状态：只有服务端
+两键与该次待提交快照逐值完全相同，才认定已提交、采用最新 revision 并清理或 rebase outbox；
+期间产生的更新使用新 revision 继续提交，不会被旧响应删除。任一值不同都是真实冲突，停止
+写入并要求重新加载，绝不盲目覆盖服务器。
 
-未知 `schemaVersion`、`kind` 或 `format` 必须拒绝，不能静默降级。`questionVersion` 是题目内容版本，不是协议版本，允许任意正安全整数，并须在提交和结果中原样关联。v1 只支持 `single_choice`、`plain_text` 和**恰好 4 个**不同 `optionId`。通用协议未来可以扩展到 2–6 个选项，但当前渲染器没有能力协商；改变数量前必须先增加 capability/schema version 协商。选项正文是字符串，可为文字，不应假设它是数字。
+## 四方法 provider
 
-## 1. createSession
+`createRemoteLearningProvider({saveId})` 实现：
 
-请求（仅允许这些字段）：
+- `POST /api/learning/create-session`（仅此请求加入 `saveId`）
+- `POST /api/learning/get-next-task`
+- `POST /api/learning/submit-answer`
+- `POST /api/learning/end-session`
 
-```json
-{
-  "schemaVersion": 1,
-  "requestId": "create-7f4a",
-  "gameSessionId": "game-a19c",
-  "gameContext": {
-    "gameId": "pvzge",
-    "levelIds": ["1-1", "1-2"],
-    "locale": "zh-CN"
-  }
-}
-```
+全部同源 `/api/` 请求经 `api-client.js` 使用页面启动时配置的 bearer、
+`credentials: "omit"`，并转发 `AbortSignal`。token 不写 cookie、localStorage、outbox、
+receipt 或日志。session 响应保留
+`questionCount/completedCount/correctCount/saveId/configurationVersion`；控制器从服务端进度
+恢复并以动态题数运行，不能用固定十题推断完成。未完成时收到 `no_task` 是可见错误。
 
-响应：
+submission 在 POST 前按 save 写入 outbox，不保存 cookie 或认证信息；reload 后先用完全
+相同的 `attemptId` 和 payload 重放，成功且响应身份逐字段匹配后才删除。deadline 时提交的
+`answered` 可由服务端正规化为 `recorded/timed_out`，这不是错误或答错。未知响应、错误
+session/save、畸形 JSON 和身份不匹配均保持门关闭并显示重试/取消。
 
-```json
-{
-  "schemaVersion": 1,
-  "status": "active",
-  "sessionId": "learning-3b62",
-  "learnerRef": "demo-learner",
-  "plan": {
-    "planId": "local-addition-v1",
-    "title": "百以内加法",
-    "subjectId": "math",
-    "skillIds": ["addition-within-100"]
-  }
-}
-```
+`submit-answer` 的已接受响应可选返回严格对象
+`feedback: {correctOptionId, correctAnswer, explanation}`；三个字段均为非空 plaintext，
+`explanation` 最长 4000 字符。该对象只在提交后出现，发题 DTO 仍不得包含答案。旧服务端或
+旧 outbox 重放响应可省略 `feedback`；客户端此时只显示 `这道题暂无详细题解`，不会猜测或
+拼造正确答案。选择答案后原题和选项保留在同一 dialog，倒计时停止，服务端确认前不标记
+正误；确认后题解阅读不限时，用户必须点击 `下一题` 或末题 `开始游戏` 才继续。
 
-## 2. getNextTask
+`end-session` 是有界且必须等待的操作。最终 `sessionId`、`questionCount` 和 grant 全部校验
+后，控制器才返回奖励。用户明确取消会尝试结束部分 session；确认成功可保留服务端已赚取
+grant，结果未知则以零奖励进入游戏，不由客户端补发。
 
-请求：
+## 游戏运行与奖励
 
-```json
-{"schemaVersion":1,"requestId":"next-83ca","sessionId":"learning-3b62"}
-```
+每次新原生关卡 controller 使用独立 `runId`，向 `POST /api/game-runs` 报告 `started`，并
+观察 `gameWon/gameLost` 或退出状态后报告一次 `won/lost/abandoned`。事件在请求前持久化，
+重试复用同一 `requestId`；`pagehide` 使用 beacon 并保留 fetch keepalive/outbox 兜底。
 
-有题响应：
+奖励数量只取 end-session 的 `final.reward.sunCount`（整数 0–500），不再由答对数乘常量。
+实际生成原生阳光后，先写每 save/run 的本地 receipt（含原生进度快照），再调用
+`POST /api/rewards/{grantId}/ack`。receipt 防止同页面/同浏览器重复生成；服务端 ack 提供
+跨请求幂等。浏览器 localStorage 与服务端数据库不是原子事务，因此不宣称跨二者严格原子。
 
-```json
-{
-  "schemaVersion": 1,
-  "status": "task",
-  "task": {
-    "taskId": "task-d011",
-    "questionId": "question-68be",
-    "questionVersion": 1,
-    "kind": "single_choice",
-    "content": {"format":"plain_text","prompt":"34 + 27 = ?"},
-    "options": [
-      {"optionId":"opt-a813","content":{"format":"plain_text","text":"60"}},
-      {"optionId":"opt-c204","content":{"format":"plain_text","text":"61"}},
-      {"optionId":"opt-f932","content":{"format":"plain_text","text":"62"}},
-      {"optionId":"opt-b417","content":{"format":"plain_text","text":"59"}}
-    ],
-    "metadata": {"subjectId":"math","skillIds":["addition-within-100"]},
-    "timeLimitMs": 20000
-  }
-}
-```
-
-也可返回 `{"schemaVersion":1,"status":"no_task"}` 或 `{"schemaVersion":1,"status":"session_ended"}`。未终结的已发任务会重复返回，不会并行生成新题。每份不可变题目内容有唯一 `questionId`，与一次派发的 `taskId` 分离；技能分类继续放在 `metadata.skillIds`。公开 task 绝不含 `answer` 或 `correctOptionId`；option ID 是与显示文本无关的不透明标识。provider 只返回学习元数据，不返回阳光类型、数量或任何游戏奖励。
-
-## 3. submitAnswer
-
-共同身份字段必须与已发任务一致：
-
-```json
-{
-  "schemaVersion": 1,
-  "sessionId": "learning-3b62",
-  "taskId": "task-d011",
-  "questionId": "question-68be",
-  "questionVersion": 1,
-  "attemptId": "attempt-5aa1",
-  "response": {"type":"answered","optionId":"opt-c204","elapsedMs":4380}
-}
-```
-
-`response` 的完整联合类型：
-
-- `{"type":"answered","optionId":"...","elapsedMs":0}`
-- `{"type":"timed_out","elapsedMs":20000}`
-- `{"type":"skipped","elapsedMs":250}`
-- `{"type":"cancelled","reason":"scene_changed|hidden|stopped|superseded","elapsedMs":250}`
-
-作答响应：
-
-```json
-{
-  "schemaVersion":1,"status":"graded","sessionId":"learning-3b62",
-  "taskId":"task-d011","questionId":"question-68be","questionVersion":1,
-  "attemptId":"attempt-5aa1","evidenceId":"evidence-91f0","correctness":"correct"
-}
-```
-
-非作答响应使用相同身份字段，另为 `"status":"recorded"`，并含
-`"outcome":"timed_out|skipped|cancelled"`。无效 session/task/option、身份或版本不匹配、attempt 冲突均抛出 `LearningProviderError`，不能当作 `incorrect`。题目一旦产生终结结果，换新 `attemptId` 再提交会失败。
-
-## 4. endSession
-
-```json
-{"schemaVersion":1,"requestId":"end-f81a","sessionId":"learning-3b62","reason":"game_ended"}
-```
-
-`reason` 为 `game_ended|replaced|stopped|abandoned`，响应为：
-
-```json
-{"schemaVersion":1,"status":"ended","sessionId":"learning-3b62"}
-```
-
-结束后不再发新题，但结束前已经发出的题仍可提交，用于解决结束与提交竞态。
-
-## 幂等、关联与本地生命周期
-
-- `schemaVersion` 是通信结构版本；`questionVersion` 是具体题目的内容版本，二者互不替代。
-- 当前每个游戏关卡身份建立独立学习会话。远端可以依据认证学习者、`gameContext` 和历史进度返回学习计划及下一道任务；本地的固定演示计划不代表已经实现个性化规划。
-- `quiz-view.js` 仅返回 `response` 意图，不包含正确性。控制器补齐会话/题目/任务/作答身份，交由 provider 判题，再由游戏自己的奖励规则决定是否发五个阳光。
-- 取题期间继续游戏；选择、超时或跳过后立即关闭题目并恢复游戏，再等待判题或记录。网络版奖励可能晚于点击到达，不能承诺网络延迟为零。
-- 编排器对每次调用设置 10 秒上限和取消信号，拒绝不匹配的结果。当前没有自动重试与跨刷新提交队列：超时代表记录结果未知，未来远程适配层须持久化原提交并使用相同 `attemptId` 查询或重试；不得伪造答错或奖励成功。
-
-- `createSession`、`getNextTask`、`endSession` 以 `requestId` 幂等；完全相同的重试返回相同结果，同 ID 不同 payload 抛 `REQUEST_CONFLICT`。每次逻辑调用必须生成新 ID，网络重试必须复用原 ID。
-- `submitAnswer` 以 session 内的 `attemptId` 幂等；完全相同的重试返回相同 `evidenceId`，冲突 payload 抛 `ATTEMPT_CONFLICT`。
-- 父级必须逐字段核对响应中的 session/task/question/version/attempt 身份，再更新当前 UI，避免迟到响应污染新场景。
-- 本地 provider 的 session、答案和幂等记录只保存在私有内存中，页面 reload 后清空；当前演示不设任意容量上限。生产远程实现应按服务端生命周期持久化并回收。
-- 本地 mock 隐藏答案是接口边界保证，不是浏览器防作弊安全边界。真正的判分和认证必须放在远程服务端。
-- 本契约不改变现有“符合条件的活跃游戏过程中”计时和出题策略；父级仅在现有触发点调用 provider，不把出题移到关卡前。
+服务端任务的 `startedAt` 为第一次发题的 UTC 时间，客户端 view 只显示当前页面内从本次
+渲染开始的倒计时。刷新后服务端仍按提交 `elapsedMs` 判断客户端 deadline，并把服务端观察
+耗时仅用于历史记录；客户端不伪造已完成或错误答案。

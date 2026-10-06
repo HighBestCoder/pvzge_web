@@ -37,11 +37,17 @@ Install Git LFS before cloning this repository. After pulling updates, run `git 
 
 Deploy the game locally by using [Docker image](https://hub.docker.com/r/gaozih/pvzge)
 
-## Addition quiz runtime
+## Pre-level learning gate
 
-The browser build includes a small addition practice prompt during active level play. The first question becomes eligible after 20 seconds of eligible, visible play in a level; later questions use a 60-second eligible-play cooldown. Pauses, tutorials, narration, selection modes, scene transitions, hidden tabs, and other blocked game states do not count toward either delay. Dismissing a question starts the regular cooldown again.
+The passwordless child app runs at `http://localhost:8080/`. Its save picker stores the selected `{token, account, save}` capability only in `sessionStorage["pvz.play.selection"]`, then opens `/game/?saveId=<id>` in the same tab. The game validates that selection with bearer-authenticated `GET /api/play/context` before importing the engine. The parent management app is separate at `http://localhost:8081/`; its login cookie is neither sent nor used by the child game, and parent logout does not stop an already selected child tab. `?demo=1` is the only explicit local-provider mode and makes no API calls.
 
-The quiz shows a 20-second countdown. Clicking any answer closes it immediately: a correct answer creates exactly five normal 50-value `SunMid` objects at row 2, columns 2 through 6, while a wrong answer has no penalty. If time expires, the quiz closes and returns to play with no reward. The suns are not auto-collected and the counter is not edited directly. Skipping, changing scenes, hiding the page while a question is open, or losing ownership of the native game pause also cancels the reward.
+The browser build runs the selected save's server-configured learning batch before each native game scene starts. The integration wraps the cached static `KeyListener.GoToGame(levelObjectArrays, restart)` method, so normal `goToLevel` calls and direct custom-level calls share one gate before resource, tutorial, card-selection, and countdown loading. There is no periodic in-battle quiz timer.
+
+Questions are sequential and resume the server's completed/correct/wrong counters. Every loading, question, and result header shows only the latest server-confirmed correct count and cumulative sunlight count/value; a failed submission does not change them. Selecting an answer immediately submits it, freezes the countdown, disables the choices, and keeps the same dialog open. Its right pane shows “正在判题”, then the server-authoritative correct answer and plaintext explanation when available; legacy responses display `这道题暂无详细题解` without inventing an answer. Correct, wrong, skipped, and timed-out results remain visible for unlimited reading time and advance only after the user clicks `下一题` or final `开始游戏`. Provider failures stay in the same right-pane retry flow and never appear as a wrong answer. Hiding the page aborts the current provider wait and retains the accepted result until the page becomes visible; stopping the page never invokes the pending native transition.
+
+The create-session response freezes the save's optional wrong-answer challenge rule for the whole practice, including resume and failed-level retry. When enabled the quiz announces the fixed cap before answering; the audited runtime currently applies it only to ordinary waves in Egypt level 3, never teaching or special levels. The local demo defaults the rule off. Final game integration consumes only the normalized challenge returned by end-session.
+
+After the native scene loads and starts gaming, the validated server `sunCount` creates normal 50-value `SunMid` objects (0–500), distributed at row 2, columns 2 through 6. Tutorial 1 is the sole timing exception: its bonus drops wait until the native first-plant, tutorial-sun, and second-plant sequence opens the wave gate, then the complete entitlement is produced and acknowledged once. A durable per-run receipt precedes reward acknowledgement; game started/won/lost/abandoned events use a durable idempotent outbox. An explicit restart of the same destination by the same in-memory player skips a second batch but creates a distinct run eligible for the same grant's server-supported per-run acknowledgement.
 
 Runtime integration lives in `docs/learning/`; it uses only already-cached SystemJS game modules and does not alter `docs/assets/main/index.js`. Run the pure fake-based unit tests with:
 
@@ -50,19 +56,25 @@ bun test
 ```
 
 For a real Chrome smoke test, start the local server and run `uv run tests/quiz-smoke.py`.
-It plays the first tutorial through the first automatically scheduled quiz, verifies five
-collectible suns and a 250-point collection, then tests wrong/skip paths and responsive
-dialog states. Screenshots are written to a temporary directory printed by the test.
-The normal first question waits until the tutorial's active instructions have finished.
+The browser bootstrap blocks game input until the `GoToGame` wrapper is installed; hook failures expose a retry control instead of leaving a blank page.
+The original full-viewport game layout is preserved: there is no added account/sync header or tutorial hint row. Save synchronization remains active in the background; blocking errors still appear separately. The native first tutorial releases zombies after its first-plant, tutorial-sun collection, and second-plant sequence. The layout regression verifies natural zombie appearance with both zero and twenty bonus suns, without forcing tutorial flags or waves.
 The UI consumes the versioned learning-provider contract documented in [LEARNING_API.md](LEARNING_API.md).
-`bootstrap.js` injects the local provider for rapid iteration: both addends are two-digit
-integers and their sum is at most 100. The public task contains question/task IDs, content,
-stable option IDs and a time limit, but no correct answer. The provider alone grades the
-submitted option ID. A non-math text task also uses the same renderer.
+`bootstrap.js` uses the real same-origin play API after validating the session selection, authoritative
+account/save context and game state before engine import. Every `/api/` request uses the selected
+bearer with `credentials: "omit"`; a 401 stops game entry/native synchronization, clears only the
+selection for that failed token, and returns to the save picker. Network failures retain the selection
+and expose retry. The public task contains question/task IDs, content, stable
+option IDs and a time limit, but no correct answer. The provider alone grades the submitted
+option ID. A non-math text task also uses the same renderer.
 
-Provider operations are asynchronous and bounded: fetching never pauses gameplay, and
-choosing an answer resumes gameplay before grading finishes. Rewards only apply to a
-matching, still-valid game attempt. Transport failures are not incorrect answers.
-The demo learner is configured only at the composition root; there is no login, remote
-learning planner, persistent progress or cross-refresh submission recovery yet. Local
-private answers are an architectural boundary, not a browser anti-cheating mechanism.
+Provider network operations are bounded to ten seconds per attempt. The server supplies each question's separate answer deadline: numeric training uses 120 seconds normally and 180 seconds for the configured advanced square and fraction stages. Retry reuses the exact request and identity payload; transport failures are never converted into incorrect answers or silent game launches.
+The two native PvZ storage keys are virtualized per account/save and synchronized with server CAS;
+submission and game-event outboxes survive reload. See `LEARNING_API.md` for failure, conflict,
+receipt and non-atomic browser/server boundaries.
+
+For an authenticated child save, the server-authoritative child name is bound to the native profile
+already selected by `PvZ2_Settings.PlayerIndex`. A valid existing index is retained so its progress
+remains active; only an invalid index falls back to profile `0`. The profile array is never reset,
+created, deleted, or imported by this binding: only the selected profile's `name` is updated through
+the native save API. The native profile-selector button and its player window are disabled, while
+Play, settings, and the rest of the main menu remain unchanged. Demo mode keeps the native behavior.
