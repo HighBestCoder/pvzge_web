@@ -36,6 +36,8 @@
 
   <link rel="stylesheet" type="text/css" href="style.css" />
   <link rel="stylesheet" type="text/css" href="learning/quiz.css" />
+  <link rel="stylesheet" type="text/css" href="learning/quiz-solution.css" />
+  <link rel="stylesheet" type="text/css" href="learning/quiz-input.css" />
 
   <script>
     (function () {
@@ -87,6 +89,11 @@
 </head>
 
 <body>
+  <section id="learning-bootstrap-status" role="alert" hidden>
+    <span data-learning-message>初始化学习模块失败，点击重试</span>
+    <button type="button" data-learning-retry>重试</button>
+    <a href="/">切换存档</a>
+  </section>
   <div id="GameDiv" cc_exact_fit_screen="true">
     <div id="Cocos3dGameContainer">
       <canvas id="GameCanvas" oncontextmenu="event.preventDefault()" tabindex="99"></canvas>
@@ -111,13 +118,16 @@
       const quizKeys = new Set();
       function guardQuizInput(event) {
         const dialog = document.getElementById('addition-quiz');
+        const retry = event.target instanceof Element && event.target.closest('[data-learning-retry]');
+        const ready = document.documentElement.dataset.learningReady === 'true';
         if (event.type === 'keydown' && dialog?.open) quizKeys.add(event.code);
         if (event.type === 'keyup' && quizKeys.delete(event.code) && !dialog?.open) {
           event.preventDefault();
           event.stopImmediatePropagation();
           return;
         }
-        if (!dialog || !dialog.open || (event.target instanceof Node && dialog.contains(event.target))) return;
+        if (retry || (dialog?.open && event.target instanceof Node && dialog.contains(event.target))) return;
+        if (ready && (!dialog || !dialog.open)) return;
         event.preventDefault();
         event.stopImmediatePropagation();
       }
@@ -127,9 +137,6 @@
     })();
   </script>
 
-  <script>
-    System.import('./index.js').catch(function (err) { console.error(err); })
-  </script>
   <script type="module" src="learning/bootstrap.js"></script>
   <script src="tmpPatch.js"></script>
 </body>
