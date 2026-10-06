@@ -1,178 +1,103 @@
-import QUESTION_DURATION_MS, { createTimedAttempt } from "./timed-attempt.js";
+import QUESTION_DURATION_MS from "./timed-attempt.js";
 import { parseTask } from "./provider.js";
-
-const DIALOG_ID = "addition-quiz";
-const TIMER_ID = "addition-quiz-timer";
-const TIMEOUT_ID = "addition-quiz-timeout";
-const BLOCKED_EVENTS = [
-  "keydown",
-  "keyup",
-  "keypress",
-  "pointerdown",
-  "pointerup",
-  "pointermove",
-  "mousedown",
-  "mouseup",
-  "click",
-  "touchstart",
-  "touchend",
-  "wheel",
-  "contextmenu",
-];
-
-function element(tag, className, text) {
-  const node = document.createElement(tag);
-  if (className) node.className = className;
-  if (text !== undefined) node.textContent = text;
-  return node;
-}
+import { normalizeProgress, updateProgress } from "./quiz-view-elements.js";
+import { showSolutionLoading, showSolutionResult } from "./quiz-feedback.js";
+import { renderLoading, renderQuestion, renderStageCard } from "./quiz-view-render.js";
+import { createQuizViewState } from "./quiz-view-state.js";
 
 export function createQuizView() {
-  let dialog = null;
-  let timer = null;
-  let previousFocus = null;
-  let resolveAsk = null;
-  let attempt = null;
-  let startedAt = 0;
-
-  const containsTarget = (event) =>
-    event.target instanceof Node && dialog?.contains(event.target);
-
-  const guardGameInput = (event) => {
-    if (dialog?.open && !containsTarget(event)) {
-      event.preventDefault();
-      event.stopImmediatePropagation();
-    }
-  };
-
-  const addGuards = () => {
-    for (const type of BLOCKED_EVENTS) {
-      window.addEventListener(type, guardGameInput, {
-        capture: true,
-        passive: false,
-      });
-    }
-  };
-
-  const removeGuards = () => {
-    for (const type of BLOCKED_EVENTS) {
-      window.removeEventListener(type, guardGameInput, true);
-    }
-  };
-
-  const finish = (value) => {
-    if (!resolveAsk) return;
-    const resolve = resolveAsk;
-    resolveAsk = null;
-    attempt = null;
-    removeGuards();
-    if (dialog?.open) dialog.close();
-    dialog?.remove();
-    dialog = null;
-    timer = null;
-    previousFocus?.focus?.({ preventScroll: true });
-    previousFocus = null;
-    resolve({ ...(value ?? { type: "timed_out" }), elapsedMs: Math.max(0, Math.floor(performance.now() - startedAt)) });
-  };
-
-  const buildDialog = (question) => {
-    dialog = element("dialog", "quiz-view");
-    const sourceDialog = dialog;
-    dialog.id = DIALOG_ID;
-    dialog.setAttribute("aria-labelledby", "addition-quiz-title");
-    dialog.setAttribute(
-      "aria-describedby",
-      `addition-quiz-prompt ${TIMEOUT_ID}`,
-    );
-
-    const panel = element("section", "quiz-view__panel");
-    const header = element("header", "quiz-view__header");
-    const title = element("h2", "quiz-view__title", "阳光学习挑战");
-    title.id = "addition-quiz-title";
-    header.append(title, element("p", "quiz-view__reward", "+5 个阳光"));
-
-    const prompt = element("div", "quiz-view__prompt");
-    prompt.id = "addition-quiz-prompt";
-    prompt.append(
-      element("p", "quiz-view__instruction", "点击答案立即返回游戏"),
-      element("p", "quiz-view__equation", question.content.prompt),
-    );
-    prompt.lastElementChild.dataset.testid = "quiz-equation";
-
-    const timing = element("div", "quiz-view__timing");
-    timer = element("p", "quiz-view__timer", `剩余 ${Math.ceil(question.timeLimitMs / 1_000)} 秒`);
-    timer.id = TIMER_ID;
-    timer.setAttribute("role", "timer");
-    timer.setAttribute("aria-live", "off");
-    const timeout = element("p", "quiz-view__timeout", "超时返回游戏，不获得奖励");
-    timeout.id = TIMEOUT_ID;
-    timing.append(timer, timeout);
-
-    const options = element("div", "quiz-view__options");
-    options.setAttribute("aria-label", "答案选项");
-    for (const option of question.options) {
-      const button = element("button", "quiz-view__button quiz-view__option", option.content.text);
-      button.type = "button";
-      button.dataset.quizOption = option.optionId;
-      button.addEventListener("click", (event) => {
-        event.stopPropagation();
-        if (dialog === sourceDialog) attempt?.answer({ type: "answered", optionId: option.optionId });
-      });
-      options.append(button);
-    }
-
-    const actions = element("div", "quiz-view__actions");
-    const skipButton = element("button", "quiz-view__skip", "暂时跳过");
-    skipButton.type = "button";
-    skipButton.addEventListener("click", (event) => {
-      event.stopPropagation();
-      if (dialog === sourceDialog) attempt?.answer({ type: "skipped" });
-    });
-    actions.append(skipButton);
-    panel.append(header, prompt, timing, options, actions);
-    dialog.append(panel);
-
-    dialog.addEventListener("cancel", (event) => {
-      event.preventDefault();
-      if (dialog === sourceDialog) attempt?.answer({ type: "skipped" });
-    });
-    dialog.addEventListener("close", () => {
-      if (dialog === sourceDialog) attempt?.dismiss({ type: "cancelled", reason: "superseded" });
-    });
-    for (const type of BLOCKED_EVENTS) {
-      dialog.addEventListener(type, (event) => event.stopPropagation());
-    }
-    return dialog;
-  };
+  const state = createQuizViewState();
 
   return {
-    ask(input) {
+    ask(input, progressInput) {
       const question = parseTask(input);
-      attempt?.dismiss({ type: "cancelled", reason: "superseded" });
-      previousFocus = document.activeElement;
-      return new Promise((resolve) => {
-        resolveAsk = resolve;
-        document.body.append(buildDialog(question));
-        addGuards();
-        dialog.showModal();
-        startedAt = performance.now();
-        attempt = createTimedAttempt({
-          durationMs: question.timeLimitMs,
-          onSettle: finish,
-          onUpdate: (remainingMs) => {
-            timer.textContent = `剩余 ${Math.ceil(remainingMs / 1_000)} 秒`;
-          },
-        });
-        dialog.querySelector(".quiz-view__option")?.focus({ preventScroll: true });
+      const progress = normalizeProgress(progressInput);
+      const suspended = state.suspendedQuestion(question.taskId);
+      if (suspended) {
+        if (suspended.pendingIntent) {
+          const intent = suspended.pendingIntent;
+          suspended.pendingIntent = null;
+          state.mount(suspended, question.kind === "numeric_entry" ? ".quiz-input__control" : ".quiz-view__option", true);
+          return Promise.resolve(intent);
+        }
+        const waiter = Promise.withResolvers();
+        suspended.resolveIntent = waiter.resolve;
+        state.mount(suspended, question.kind === "numeric_entry" ? ".quiz-input__control" : ".quiz-view__option", true);
+        return waiter.promise;
+      }
+      state.replaceActive();
+      return new Promise((resolveIntent) => {
+        renderQuestion({ question, progress, resolveIntent, state });
       });
+    },
+
+    showStageCard(card, progressInput) {
+      const suspended = state.suspendedStageCard(card.stageKey);
+      if (suspended) {
+        const waiter = Promise.withResolvers();
+        suspended.cardWaiter = waiter;
+        state.mount(suspended, ".quiz-stage-card__start", true);
+        return waiter.promise;
+      }
+      state.replaceActive();
+      const waiter = Promise.withResolvers();
+      renderStageCard({ card, progress: normalizeProgress(progressInput), waiter, state });
+      return waiter.promise;
+    },
+
+    showLoading(progressInput, options = {}) {
+      const progress = normalizeProgress(progressInput);
+      const source = state.submittedSource();
+      if (source) {
+        if (!state.isActive(source)) state.mount(source, ".quiz-view__cancel", true);
+        updateProgress(source.dialog, progress);
+        source.cancel = options.onCancel;
+        showSolutionLoading(source.solution, progress.message, {
+          onCancel: options.onCancel,
+          onRetry: options.onRetry,
+        });
+        return;
+      }
+      state.replaceActive();
+      renderLoading({ progress, options, state });
+    },
+
+    showResult(result, progressInput) {
+      const source = state.submittedSource();
+      if (!source) throw new Error("showResult requires the submitted question view");
+      const progress = normalizeProgress(progressInput);
+      if (!state.isActive(source)) state.mount(source, ".quiz-solution__next", true);
+      updateProgress(source.dialog, progress);
+      const waiter = Promise.withResolvers();
+      state.settleContinue(source, { action: "dismissed", reason: "superseded" });
+      source.continueWaiter = waiter;
+      if (result.feedback?.correctOptionId && source.options) {
+        for (const button of source.options.querySelectorAll("button")) {
+          if (button.dataset.quizOption === result.feedback.correctOptionId) {
+            button.classList.add("quiz-view__option--correct");
+            button.setAttribute("aria-label", `${button.textContent}，正确答案`);
+          } else if (result.status === "graded" && result.correctness === "incorrect" &&
+            button.classList.contains("quiz-view__option--selected")) {
+            button.classList.add("quiz-view__option--incorrect");
+            button.setAttribute("aria-label", `${button.textContent}，你的答案，回答错误`);
+          }
+        }
+      }
+      const next = showSolutionResult(source.solution, result, progress.current >= progress.total, () => {
+        if (!state.isActive(source) || source.continueWaiter !== waiter) return;
+        state.settleContinue(source, { action: "next" });
+        state.release(source);
+      });
+      next.focus({ preventScroll: true });
+      return waiter.promise;
     },
 
     dismiss(reason = "superseded") {
-      attempt?.dismiss({ type: "cancelled", reason });
+      state.replaceActive(reason);
     },
 
     isOpen() {
-      return Boolean(dialog?.open);
+      return state.isOpen();
     },
   };
 }
