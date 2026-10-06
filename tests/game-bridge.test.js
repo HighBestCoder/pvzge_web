@@ -1,222 +1,247 @@
 import { describe, expect, test } from "bun:test";
 
-import { createGameBridge } from "../docs/learning/game-bridge.js";
+import { createGameBridge, createSystemRuntime } from "../docs/learning/game-bridge.js";
 
-function createRuntime() {
-  const invalid = new Set();
-  const scene = {};
-  const level = {
-    node: { activeInHierarchy: true },
-    isSeedChooserMode: () => false,
-    carddeck_displayer_isActive: () => false,
-  };
-  const ui = { node: { activeInHierarchy: true }, sceneEnabled: true, paused: false, index: -1, mouseDown: false };
-  const runtime = {
-    cc: {
-      director: { gameSpeed: 1, getScene: () => scene, isPaused: () => false },
-      game: { isPaused: () => false },
-    },
-    valid: (value) => Boolean(value) && !invalid.has(value),
-    scene, identity: level, levelId: [1, 2], gaming: true, level, ui,
-    superSlowed: false, keys: { isInGame: true }, npc: { HasFlow: () => false },
-    droppings: { controller: {}, layer: {}, SunMid: {} },
+function runtimeFixture() {
+  const player = {};
+  const oldScene = {};
+  const oldController = {};
+  const runtime = { scene: oldScene, identity: oldController, levelId: [1, 2], player, gaming: false,
+    valid: (value) => Boolean(value), level: { node: { activeInHierarchy: true } },
+    ui: { node: { activeInHierarchy: true }, sceneEnabled: true, paused: false },
+    cc: { game: { isPaused: () => false }, director: { isPaused: () => false } },
+    droppings: { controller: {}, layer: {}, SunMid: {} }, sunCount: { component: {} },
     square: { Square00: {}, getSquareWorldPosition: (row, column) => ({ x: column, y: row }) },
-    sunCount: { component: {} }, sunflower: { produceSun() {} }, invalid,
-  };
-  ui.pauseMenu = () => {
-    ui.paused = !ui.paused;
-    runtime.cc.director.gameSpeed = ui.paused ? 0 : 1;
-  };
-  return runtime;
+    sunflower: { produceSun() {} } };
+  return { oldController, oldScene, player, runtime };
 }
 
-describe("sun reward bridge", () => {
-  test("precomputes five squares and produces separate 50-value suns exactly once", async () => {
-    const produced = [];
-    const columns = [];
-    const runtime = createRuntime();
-    runtime.square.getSquareWorldPosition = (row, column) => {
-      columns.push([row, column]);
-      return { x: column, y: row };
+async function advanceFrame(frames) {
+  for (let turn = 0; turn < 8 && frames.length === 0; turn += 1) await Promise.resolve();
+  frames.shift()();
+}
+
+describe("post-load reward bridge", () => {
+  test("maps the case-sensitive native zombie factory export", () => {
+    const factory = { spawnZombieFromLaneByType() {} };
+    const modules = {
+      cc: { isValid() {}, director: { getScene: () => ({}) } },
+      level: { LevelPlay: {} }, ui: { UIInGame: {} }, player: { AllPlayerProperties: {} }, sunflower: { sunflower: {} },
+      droppings: { droppings: {} }, square: { Square: {} }, sunCount: { SunCount: {} },
+      zombies: { zombies: factory, Zombies: class {} }, frontYard: { FrontYard: {} },
     };
-    runtime.sunflower.produceSun = (...args) => produced.push(args);
-    const bridge = createGameBridge({ getRuntime: () => runtime });
-    const snapshot = bridge.preflight();
-    await bridge.pauseForQuiz(snapshot);
+    const system = { resolve: (id) => id, get: (id) => modules[id === "cc" ? "cc" : Object.entries({
+      level: "levelController.ts", ui: "UI.ts", player: "PlayerProperties.ts", sunflower: "Sunflower.ts",
+      droppings: "Droppings.ts", square: "Square.ts", sunCount: "SunCount.ts", zombies: "Zombies.ts", frontYard: "FrontYard.ts",
+    }).find(([, suffix]) => id.endsWith(suffix))?.[0]] };
 
-    bridge.releasePause(snapshot);
-    bridge.award(snapshot, "attempt-1");
-    bridge.award(snapshot, "attempt-1");
-
-    expect(columns).toEqual([[2, 2], [2, 3], [2, 4], [2, 5], [2, 6]]);
-    expect(produced).toHaveLength(5);
-    expect(produced.every(([value, , height, a, b, c]) => value === 50 && height === 40 && !a && !b && !c)).toBe(true);
+    expect(createSystemRuntime(system).zombies).toBe(factory);
   });
 
-  test("rewards once while native speed is still catching up after quiz resume", async () => {
+  test("mounts and reports a zero-sun wave challenge after native controller replacement", async () => {
+    const fixture = runtimeFixture();
+    const mounts = [];
+    const statuses = [];
+    fixture.runtime.scene = {};
+    fixture.runtime.levelId = ["egypt3"];
+    fixture.runtime.identity = fixture.runtime.level = { node: { activeInHierarchy: true }, gameStarted: true };
+    fixture.runtime.gaming = true;
+    fixture.runtime.levelId = ["egypt3"];
+    const waveChallenge = { cancelPending() {}, mount(input) { mounts.push(input); return { status: "active", levelId: "egypt3" }; } };
+    const bridge = createGameBridge({ getRuntime: () => fixture.runtime, nextFrame: async () => {}, waveChallenge });
+
+    const status = await bridge.watchReward({ oldController: fixture.oldController, player: fixture.player,
+      targetLevelIds: ["egypt3"], challenge: { enabled: true }, reward: { grantId: "g", sunCount: 0 },
+      runId: "r", ownsTarget: () => true, onChallengeStatus: (value) => statuses.push(value) });
+
+    expect(mounts).toHaveLength(1);
+    expect(status).toEqual({ status: "active", levelId: "egypt3" });
+    expect(statuses).toEqual([status]);
+  });
+
+  test("retries challenge mounting while the replacement controller initializes", async () => {
+    const fixture = runtimeFixture();
+    const statuses = [{ status: "pending", reason: "runtime-initializing" }, { status: "active", levelId: "egypt3" }];
+    const waveChallenge = { cancelPending() {}, mount() { return statuses.shift(); } };
+    const frames = [];
+    fixture.runtime.identity = fixture.runtime.level = { node: { activeInHierarchy: true }, gameStarted: true };
+    fixture.runtime.gaming = true;
+    fixture.runtime.levelId = ["egypt3"];
+    const bridge = createGameBridge({ getRuntime: () => fixture.runtime, waveChallenge,
+      nextFrame: () => new Promise((resolve) => frames.push(resolve)) });
+    const pending = bridge.watchReward({ oldController: fixture.oldController, player: fixture.player,
+      targetLevelIds: ["egypt3"], reward: { grantId: "g", sunCount: 0 }, runId: "r", ownsTarget: () => true });
+    await advanceFrame(frames);
+    expect(await pending).toEqual({ status: "active", levelId: "egypt3" });
+  });
+
+  test("mounts once across many pre-game frames and reports started once after game start", async () => {
+    const fixture = runtimeFixture();
+    const frames = [];
+    const mounts = [];
+    const reports = [];
+    const controller = { node: { activeInHierarchy: true }, gameStarted: false };
+    fixture.runtime.identity = fixture.runtime.level = controller;
+    fixture.runtime.scene = {};
+    fixture.runtime.levelId = ["egypt3"];
+    const waveChallenge = { cancelPending() {}, mount(input) { mounts.push(input); return { status: "active" }; } };
+    const reporter = { async report(value) { reports.push(value); } };
+    const bridge = createGameBridge({ getRuntime: () => fixture.runtime, waveChallenge, reporter,
+      nextFrame: () => new Promise((resolve) => frames.push(resolve)) });
+    const pending = bridge.watchReward({ oldController: fixture.oldController, player: fixture.player,
+      targetLevelIds: ["egypt3"], challenge: { enabled: true }, reward: { grantId: "g", sunCount: 0 },
+      runId: "r", ownsTarget: () => true });
+
+    for (let frame = 0; frame < 40; frame += 1) {
+      await advanceFrame(frames);
+    }
+    expect(mounts).toHaveLength(1);
+    expect(reports).toHaveLength(0);
+    controller.gameStarted = true;
+    fixture.runtime.gaming = true;
+    await advanceFrame(frames);
+    expect(await pending).toEqual({ status: "active" });
+    expect(reports.filter(({ outcome }) => outcome === "started")).toHaveLength(1);
+    controller.gameWon = true;
+    await advanceFrame(frames);
+    await Promise.resolve();
+    expect(reports.filter(({ outcome }) => outcome === "won")).toHaveLength(1);
+  });
+
+  test("returns when the mounted controller changes before game start", async () => {
+    const fixture = runtimeFixture();
+    const frames = [];
+    let reports = 0;
+    fixture.runtime.identity = fixture.runtime.level = { node: { activeInHierarchy: true }, gameStarted: false };
+    fixture.runtime.levelId = ["egypt3"];
+    const bridge = createGameBridge({ getRuntime: () => fixture.runtime,
+      waveChallenge: { cancelPending() {}, mount: () => ({ status: "active" }) },
+      reporter: { async report() { reports += 1; } },
+      nextFrame: () => new Promise((resolve) => frames.push(resolve)) });
+    const pending = bridge.watchReward({ oldController: fixture.oldController, player: fixture.player,
+      targetLevelIds: ["egypt3"], reward: { grantId: "g", sunCount: 0 }, runId: "r", ownsTarget: () => true });
+    await Promise.resolve();
+    fixture.runtime.identity = fixture.runtime.level = { node: { activeInHierarchy: true }, gameStarted: true };
+    await advanceFrame(frames);
+    expect(await pending).toBeUndefined();
+    expect(reports).toBe(0);
+  });
+
+  test("terminal state before game start returns without reporting or spawning reward", async () => {
+    const fixture = runtimeFixture();
+    const frames = [];
+    let reports = 0;
+    let rewards = 0;
+    fixture.runtime.identity = fixture.runtime.level = { node: { activeInHierarchy: true }, gameStarted: false };
+    fixture.runtime.levelId = ["egypt3"];
+    fixture.runtime.sunflower.produceSun = () => { rewards += 1; };
+    const bridge = createGameBridge({ getRuntime: () => fixture.runtime,
+      waveChallenge: { cancelPending() {}, mount: () => ({ status: "active" }) },
+      reporter: { async report() { reports += 1; } },
+      nextFrame: () => new Promise((resolve) => frames.push(resolve)) });
+    const pending = bridge.watchReward({ oldController: fixture.oldController, player: fixture.player,
+      targetLevelIds: ["egypt3"], reward: { grantId: "g", sunCount: 5 }, runId: "r", ownsTarget: () => true });
+    await Promise.resolve();
+    fixture.runtime.level.gameLost = true;
+    await advanceFrame(frames);
+    await pending;
+    expect(reports).toBe(0);
+    expect(rewards).toBe(0);
+  });
+
+  test("awards fifty native 50-value suns for ten correct answers", async () => {
+    const fixture = runtimeFixture();
     const produced = [];
-    const runtime = createRuntime();
-    runtime.ui.pauseMenu = () => {
-      runtime.ui.paused = !runtime.ui.paused;
-      if (runtime.ui.paused) runtime.cc.director.gameSpeed = 0;
-    };
-    runtime.sunflower.produceSun = (...args) => produced.push(args);
-    const bridge = createGameBridge({ getRuntime: () => runtime });
-    const snapshot = bridge.preflight();
-
-    await bridge.pauseForQuiz(snapshot);
-    bridge.releasePause(snapshot);
-    expect(runtime.ui.paused).toBe(false);
-    expect(runtime.cc.director.gameSpeed).toBe(0);
-    bridge.award(snapshot, "local-grade");
-    bridge.award(snapshot, "local-grade");
-
-    expect(produced).toHaveLength(5);
+    fixture.runtime.sunflower.produceSun = (...args) => produced.push(args);
+    let frame;
+    const bridge = createGameBridge({ getRuntime: () => fixture.runtime,
+      nextFrame: () => new Promise((resolve) => { frame = resolve; }) });
+    const pending = bridge.watchReward({ oldScene: fixture.oldScene, oldController: fixture.oldController,
+      player: fixture.player, targetLevelIds: [1, 2], reward: { grantId: "g", sunCount: 50 }, runId: "r", ownsTarget: () => true });
+    fixture.runtime.scene = {};
+    fixture.runtime.identity = { node: { activeInHierarchy: true }, gameStarted: true };
+    fixture.runtime.level = fixture.runtime.identity;
+    fixture.runtime.gaming = true;
+    frame();
+    await pending;
+    expect(produced).toHaveLength(50);
+    expect(produced.every(([value]) => value === 50)).toBe(true);
   });
 
-  test("marks an award attempted before spawning so a partial failure cannot retry", async () => {
-    let calls = 0;
-    const runtime = createRuntime();
-    runtime.sunflower.produceSun = () => { calls += 1; if (calls === 3) throw new Error("spawn failed"); };
-    const bridge = createGameBridge({ getRuntime: () => runtime });
-    const snapshot = bridge.preflight();
-    await bridge.pauseForQuiz(snapshot);
+  test("caps rewards above ten correct answers at fifty native suns", async () => {
+    const fixture = runtimeFixture();
+    const produced = [];
+    fixture.runtime.sunflower.produceSun = (...args) => produced.push(args);
+    fixture.runtime.scene = {};
+    fixture.runtime.identity = fixture.runtime.level = { node: { activeInHierarchy: true }, gameStarted: true };
+    fixture.runtime.gaming = true;
+    const bridge = createGameBridge({ getRuntime: () => fixture.runtime, nextFrame: async () => {} });
 
-    bridge.releasePause(snapshot);
-    expect(() => bridge.award(snapshot, "attempt-1")).toThrow("spawn failed");
-    bridge.award(snapshot, "attempt-1");
-    expect(calls).toBe(3);
+    await bridge.watchReward({ oldScene: fixture.oldScene, oldController: fixture.oldController,
+      player: fixture.player, targetLevelIds: [1, 2], reward: { grantId: "g", sunCount: 50 }, runId: "r", ownsTarget: () => true });
+
+    expect(produced).toHaveLength(50);
+    expect(produced.every(([value]) => value === 50)).toBe(true);
   });
 
-  test.each(["gameWon", "gameLost", "gameOver"])("does not reward a terminal same-scene level that has %s", async (terminal) => {
+  test("does not award wrong answers or repeat after later frames", async () => {
+    const fixture = runtimeFixture();
     let calls = 0;
-    const runtime = createRuntime();
-    runtime.sunflower.produceSun = () => { calls += 1; };
-    const bridge = createGameBridge({ getRuntime: () => runtime });
-    const snapshot = bridge.preflight();
-    await bridge.pauseForQuiz(snapshot);
-
-    runtime.level[terminal] = true;
-    runtime.gaming = false;
-    bridge.releasePause(snapshot);
-    bridge.award(snapshot, "attempt-1");
-
+    fixture.runtime.sunflower.produceSun = () => { calls += 1; };
+    fixture.runtime.scene = {};
+    fixture.runtime.identity = fixture.runtime.level = { node: { activeInHierarchy: true }, gameStarted: true };
+    fixture.runtime.gaming = true;
+    const bridge = createGameBridge({ getRuntime: () => fixture.runtime, nextFrame: async () => {} });
+    await bridge.watchReward({ oldScene: fixture.oldScene, oldController: fixture.oldController,
+      player: fixture.player, targetLevelIds: [1, 2], reward: { grantId: "g", sunCount: 0 }, runId: "r", ownsTarget: () => true });
+    await Promise.resolve();
     expect(calls).toBe(0);
   });
 
-  test("revalidates every reward resource before spawning any sun", async () => {
+  test("cancels stale player, scene ownership, and terminal rewards", async () => {
+    for (const mutate of [
+      (runtime) => { runtime.player = {}; },
+      (_runtime, ownership) => { ownership.value = false; },
+      (runtime) => { runtime.level.gameWon = true; },
+    ]) {
+      const fixture = runtimeFixture();
+      let calls = 0;
+      const ownership = { value: true };
+      fixture.runtime.sunflower.produceSun = () => { calls += 1; };
+      let frame;
+      const bridge = createGameBridge({ getRuntime: () => fixture.runtime,
+        nextFrame: () => new Promise((resolve) => { frame = resolve; }) });
+      const pending = bridge.watchReward({ oldScene: fixture.oldScene, oldController: fixture.oldController,
+        player: fixture.player, targetLevelIds: [1, 2], reward: { grantId: "g", sunCount: 5 }, runId: "r", ownsTarget: () => ownership.value });
+      fixture.runtime.scene = {};
+      fixture.runtime.identity = fixture.runtime.level = { node: { activeInHierarchy: true }, gameStarted: true };
+      fixture.runtime.gaming = true;
+      mutate(fixture.runtime, ownership);
+      frame();
+      await pending;
+      expect(calls).toBe(0);
+    }
+  });
+
+  test("waits for native reward resources instead of losing an early entitlement", async () => {
+    const fixture = runtimeFixture();
     let calls = 0;
-    const runtime = createRuntime();
-    runtime.sunflower.produceSun = () => { calls += 1; };
-    const bridge = createGameBridge({ getRuntime: () => runtime });
-    const snapshot = bridge.preflight();
-    await bridge.pauseForQuiz(snapshot);
-
-    runtime.invalid.add(runtime.droppings.SunMid);
-    bridge.releasePause(snapshot);
-    bridge.award(snapshot, "attempt-1");
-
+    const frames = [];
+    fixture.runtime.sunflower.produceSun = () => { calls += 1; };
+    const bridge = createGameBridge({ getRuntime: () => fixture.runtime,
+      nextFrame: () => new Promise((resolve) => frames.push(resolve)) });
+    const pending = bridge.watchReward({ oldScene: fixture.oldScene, oldController: fixture.oldController,
+      player: fixture.player, targetLevelIds: [1, 2], reward: { grantId: "g", sunCount: 5 }, runId: "r", ownsTarget: () => true });
+    fixture.runtime.scene = {};
+    fixture.runtime.identity = fixture.runtime.level = { node: { activeInHierarchy: true }, gameStarted: true };
+    fixture.runtime.gaming = true;
+    fixture.runtime.droppings.SunMid = null;
+    frames.shift()();
+    await Promise.resolve();
     expect(calls).toBe(0);
-  });
-
-  test("does not reward during the cannon victory transition", async () => {
-    const runtime = createRuntime();
-    let calls = 0;
-    runtime.sunflower.produceSun = () => { calls += 1; };
-    const bridge = createGameBridge({ getRuntime: () => runtime });
-    const snapshot = bridge.preflight();
-    await bridge.pauseForQuiz(snapshot);
-    runtime.level._cannonVic = true;
-    bridge.releasePause(snapshot);
-    bridge.award(snapshot, "attempt-1");
-    expect(calls).toBe(0);
-  });
-
-  test("rejects a reward while the user has paused after the quiz resumed", async () => {
-    const runtime = createRuntime();
-    let calls = 0;
-    runtime.sunflower.produceSun = () => { calls += 1; };
-    const bridge = createGameBridge({ getRuntime: () => runtime });
-    const snapshot = bridge.preflight();
-    await bridge.pauseForQuiz(snapshot);
-    bridge.releasePause(snapshot);
-    runtime.ui.pauseMenu();
-    bridge.award(snapshot, "attempt-1");
-    expect(calls).toBe(0);
-  });
-
-  test("requires a nonempty attempt tied to a legitimately acquired pause", async () => {
-    const runtime = createRuntime();
-    let calls = 0;
-    runtime.sunflower.produceSun = () => { calls += 1; };
-    const bridge = createGameBridge({ getRuntime: () => runtime });
-    const unpaused = bridge.preflight();
-    bridge.award(unpaused, "attempt-x");
-    const acquired = bridge.preflight();
-    await bridge.pauseForQuiz(acquired);
-    bridge.releasePause(acquired);
-    bridge.award(acquired, "");
-    expect(calls).toBe(0);
-  });
-});
-
-describe("game bridge lifecycle", () => {
-  test("does not claim pause ownership when speed is zero but ui.paused is false", async () => {
-    const runtime = createRuntime();
-    runtime.ui.pauseMenu = () => {};
-    const bridge = createGameBridge({ getRuntime: () => runtime, nextFrame: async () => {} });
-    const snapshot = bridge.preflight();
-    runtime.cc.director.gameSpeed = 0;
-
-    expect(await bridge.pauseForQuiz(snapshot)).toBe(false);
-  });
-
-  test("releasePause without acquired ownership is a no-op", () => {
-    let toggles = 0;
-    const runtime = createRuntime();
-    runtime.ui.pauseMenu = () => { toggles += 1; };
-    const bridge = createGameBridge({ getRuntime: () => runtime });
-    const snapshot = bridge.preflight();
-    runtime.ui.paused = true;
-
-    bridge.releasePause(snapshot);
-
-    expect(toggles).toBe(0);
-  });
-
-  test.each(["Tutorial_Wave_Stuck", "Tutorial_Point_At_Grass"])("suppresses quizzes while %s is active", (flag) => {
-    const runtime = createRuntime();
-    runtime.level[flag] = true;
-    const bridge = createGameBridge({ getRuntime: () => runtime });
-
-    expect(bridge.isEligible()).toBe(false);
-  });
-
-  test("rejects an invalid native scene and invalid components", () => {
-    const runtime = createRuntime();
-    const bridge = createGameBridge({ getRuntime: () => runtime });
-    const snapshot = bridge.preflight();
-
-    runtime.invalid.add(runtime.scene);
-    expect(bridge.isCurrent(snapshot)).toBe(false);
-    runtime.invalid.delete(runtime.scene);
-    runtime.invalid.add(runtime.level);
-    expect(bridge.isCurrent(snapshot)).toBe(false);
-  });
-
-  test("keeps identity stable when level ID arrays are recreated with equal contents", () => {
-    const runtime = createRuntime();
-    const bridge = createGameBridge({ getRuntime: () => ({ ...runtime, levelId: [...runtime.levelId] }) });
-
-    expect(bridge.getLevelIdentity()).toBe(bridge.getLevelIdentity());
-  });
-
-  test("exposes provider context and no identity when no level is active", () => {
-    const runtime = createRuntime();
-    const bridge = createGameBridge({ getRuntime: () => runtime });
-    expect(bridge.getGameContext()).toEqual({ gameId: "pvzge", levelIds: ["1", "2"], locale: "zh-CN" });
-    runtime.gaming = false;
-    expect(bridge.getLevelIdentity()).toBeNull();
-    expect(bridge.hasEnded()).toBe(true);
+    fixture.runtime.droppings.SunMid = {};
+    frames.shift()();
+    await pending;
+    expect(calls).toBe(5);
   });
 });
