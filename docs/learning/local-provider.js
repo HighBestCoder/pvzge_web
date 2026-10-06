@@ -13,6 +13,7 @@ const PLAN = {
   subjectId: "math",
   skillIds: ["addition-within-100"],
 };
+const QUESTION_COUNT = 10;
 
 function clone(value) {
   return structuredClone(value);
@@ -87,7 +88,9 @@ export function createLocalLearningProvider({
       },
     });
     session.openTaskId = task.task.taskId;
-    session.tasks.set(task.task.taskId, { publicResponse: task, correctOptionId, terminalAttemptId: null });
+    session.tasks.set(task.task.taskId, { publicResponse: task, correctOptionId,
+      correctAnswer: String(question.answer), explanation: `${question.left} + ${question.right} = ${question.answer}`,
+      terminalAttemptId: null });
     return task;
   }
 
@@ -96,8 +99,12 @@ export function createLocalLearningProvider({
     const request = parseCreateSessionRequest(input);
     return replayRequest("createSession", request, () => {
       const sessionId = id();
-      const response = parseSession({ schemaVersion: 1, status: "active", sessionId, learnerRef, plan: PLAN });
-      sessions.set(sessionId, { ended: false, openTaskId: null, tasks: new Map(), attempts: new Map() });
+      const response = parseSession({ schemaVersion: 1, status: "active", sessionId, learnerRef, plan: PLAN,
+        questionCount: QUESTION_COUNT, completedCount: 0, correctCount: 0, wrongCount: 0,
+        challengeRule: { enabled: false, version: 0, perWaveCap: 2, maxWaves: 3, totalCap: 6 },
+        saveId: request.saveId ?? 1, configurationVersion: 1 });
+      sessions.set(sessionId, { ended: false, openTaskId: null, tasks: new Map(), attempts: new Map(),
+        completedCount: 0, correctCount: 0, wrongCount: 0 });
       return response;
     });
   }
@@ -109,6 +116,7 @@ export function createLocalLearningProvider({
       const session = requireSession(request.sessionId);
       if (session.ended) return parseTaskResponse({ schemaVersion: 1, status: "session_ended" });
       if (session.openTaskId) return session.tasks.get(session.openTaskId).publicResponse;
+      if (session.completedCount >= QUESTION_COUNT) return parseTaskResponse({ schemaVersion: 1, status: "no_task" });
       return createTask(session);
     });
   }
@@ -141,10 +149,21 @@ export function createLocalLearningProvider({
       attemptId: request.attemptId,
       evidenceId: id(),
     };
-    const result = request.response.type === "answered"
-      ? parseSubmissionResult({ ...common, status: "graded", correctness: request.response.optionId === record.correctOptionId ? "correct" : "incorrect" })
-      : parseSubmissionResult({ ...common, status: "recorded", outcome: request.response.type });
+    const correctness = request.response.type === "answered"
+      ? request.response.optionId === record.correctOptionId ? "correct" : "incorrect" : null;
     record.terminalAttemptId = request.attemptId;
+    session.completedCount += 1;
+    if (correctness === "correct") session.correctCount += 1;
+    if (correctness === "incorrect") session.wrongCount += 1;
+    const progress = { correctCount: session.correctCount, wrongCount: session.wrongCount,
+      completedCount: session.completedCount, rewardSunCount: session.correctCount * 5,
+      rewardSunValue: session.correctCount * 250 };
+    const feedback = { correctOptionId: record.correctOptionId, correctAnswer: record.correctAnswer,
+      explanation: record.explanation };
+    const result = request.response.type === "answered"
+      ? parseSubmissionResult({ ...common, status: "graded", correctness, progress, feedback }, task.kind)
+      : parseSubmissionResult({ ...common, status: "recorded", outcome: request.response.type,
+        progress, ...(request.response.type === "cancelled" ? {} : { feedback }) }, task.kind);
     if (session.openTaskId === request.taskId) session.openTaskId = null;
     session.attempts.set(request.attemptId, { payload, result: clone(result) });
     return clone(result);
@@ -154,8 +173,15 @@ export function createLocalLearningProvider({
     checkSignal(signal);
     const request = parseEndSessionRequest(input);
     return replayRequest("endSession", request, () => {
-      requireSession(request.sessionId).ended = true;
-      return { schemaVersion: 1, status: "ended", sessionId: request.sessionId };
+      const session = requireSession(request.sessionId);
+      session.ended = true;
+      return { schemaVersion: 1, status: "ended", sessionId: request.sessionId,
+        final: { correctCount: session.correctCount, wrongCount: session.wrongCount,
+          questionCount: QUESTION_COUNT,
+          passed: session.correctCount >= 8,
+          reward: { grantId: `local-${request.sessionId}`, sunCount: session.correctCount * 5 },
+          challenge: { enabled: false, ruleVersion: 0, extraPerWave: 0, maxWaves: 3,
+            totalCap: 6 } } };
     });
   }
 

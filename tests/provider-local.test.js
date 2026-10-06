@@ -77,6 +77,8 @@ describe("local learning provider", () => {
     };
     const result = await provider.submitAnswer(submission);
     expect(result.correctness).toBe("correct");
+    expect(result.feedback).toEqual({ correctOptionId: correct.optionId, correctAnswer: "20",
+      explanation: "10 + 10 = 20" });
     expect(await provider.submitAnswer(structuredClone(submission))).toEqual(result);
     await expect(provider.submitAnswer({ ...submission, response: { ...submission.response, elapsedMs: 1201 } })).rejects.toMatchObject({ code: "ATTEMPT_CONFLICT" });
     await expect(provider.submitAnswer({ ...submission, attemptId: "attempt-2" })).rejects.toMatchObject({ code: "TASK_ALREADY_TERMINAL" });
@@ -105,8 +107,10 @@ describe("local learning provider", () => {
     const provider = makeProvider();
     const { session, task } = await start(provider);
     const endRequest = { schemaVersion: 1, requestId: "end-1", sessionId: session.sessionId, reason: "game_ended" };
-    expect(await provider.endSession(endRequest)).toEqual({ schemaVersion: 1, status: "ended", sessionId: session.sessionId });
-    expect(await provider.endSession({ ...endRequest })).toEqual({ schemaVersion: 1, status: "ended", sessionId: session.sessionId });
+    const ended = await provider.endSession(endRequest);
+    expect(ended).toMatchObject({ schemaVersion: 1, status: "ended", sessionId: session.sessionId,
+      final: { correctCount: 0, questionCount: 10, reward: { sunCount: 0 } } });
+    expect(await provider.endSession({ ...endRequest })).toEqual(ended);
     expect(await provider.getNextTask({ schemaVersion: 1, requestId: "next-after", sessionId: session.sessionId }))
       .toEqual({ schemaVersion: 1, status: "session_ended" });
     const result = await provider.submitAnswer({
