@@ -1,266 +1,478 @@
 import { describe, expect, test } from "bun:test";
 
 import { createQuizController } from "../docs/learning/quiz-controller.js";
+import { formatProgressSummary, normalizeProgress } from "../docs/learning/quiz-view-elements.js";
+
+const task = (number) => ({
+  taskId: `task-${number}`, questionId: `question-${number}`, questionVersion: 1,
+  kind: "single_choice", content: { format: "plain_text", prompt: `${number} + 1 = ?` },
+  options: ["a", "b", "c", "d"].map((optionId) => ({
+    optionId, content: { format: "plain_text", text: optionId },
+  })),
+  metadata: { subjectId: "math", skillIds: ["addition"] }, timeLimitMs: 20_000,
+});
 
 function deferred() {
   let resolve;
-  let reject;
-  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
-  return { promise, resolve, reject };
+  const promise = new Promise((done) => { resolve = done; });
+  return { promise, resolve };
 }
 
-const task = {
-  taskId: "task-history", questionId: "capital-france", questionVersion: 7, kind: "single_choice",
-  content: { format: "plain_text", prompt: "法国的首都是哪里？" },
-  options: ["paris", "rome", "london", "berlin"].map((optionId) => ({
-    optionId, content: { format: "plain_text", text: optionId.toUpperCase() },
-  })),
-  metadata: { subjectId: "history", skillIds: ["world-capitals"] }, timeLimitMs: 20_000,
-};
-
-function createHarness({ create, nextTask, submit, end } = {}) {
-  let identity = "level-1";
-  let eligible = true;
-  let current = true;
-  let open = false;
-  let paused = false;
-  let response = Promise.resolve({ type: "answered", optionId: "paris", elapsedMs: 25 });
-  const events = [];
-  const submissions = [];
-  const ends = [];
-  const errors = [];
+function harness({ answers = [], tasks = [task(1), task(2), task(3)], submitHook,
+  showResult, questionCount = tasks.length, completedCount = 0, correctCount = 0, wrongCount = 0,
+  challengeRule = { enabled: false, version: 0, perWaveCap: 2, maxWaves: 3, totalCap: 6 } } = {}) {
+  const requests = { create: [], next: [], submit: [], end: [] };
+  const loading = [];
+  const progress = [];
+  const feedback = [];
+  const dismissals = [];
+  let next = 0;
+  let providerCorrect = correctCount;
+  let visible = true;
   const provider = {
     async createSession(request) {
-      events.push("create");
-      if (create) return create(request);
-      expect(request.gameContext).toEqual({ gameId: "pvzge", levelIds: ["1-1"], locale: "zh-CN" });
-      return { schemaVersion: 1, status: "active", sessionId: `session-${identity}`, learnerRef: "learner-z",
-        plan: { planId: "history", title: "历史", subjectId: "history", skillIds: ["world-capitals"] } };
+      requests.create.push(structuredClone(request));
+      return { schemaVersion: 1, status: "active", sessionId: "session-1", learnerRef: "learner",
+        plan: { planId: "plan", title: "Plan", subjectId: "math", skillIds: ["addition"] },
+        questionCount, completedCount, correctCount, wrongCount, challengeRule,
+        saveId: 1, configurationVersion: 1 };
     },
-    async getNextTask() {
-      events.push(paused ? "fetch-paused" : "fetch-active");
-      return nextTask ? nextTask() : { schemaVersion: 1, status: "task", task };
+    async getNextTask(request) {
+      requests.next.push(structuredClone(request));
+      const value = tasks[next++];
+      return value ? { schemaVersion: 1, status: "task", task: value } : { schemaVersion: 1, status: "no_task" };
     },
     async submitAnswer(request) {
-      events.push(paused ? "submit-paused" : "submit-active");
-      submissions.push(request);
-      if (submit) return submit(request);
-      return { schemaVersion: 1, status: request.response.type === "answered" ? "graded" : "recorded",
+      requests.submit.push(structuredClone(request));
+      const result = submitHook ? await submitHook(request, requests.submit.length) : {
+        schemaVersion: 1, status: request.response.type === "answered" ? "graded" : "recorded",
         sessionId: request.sessionId, taskId: request.taskId, questionId: request.questionId,
         questionVersion: request.questionVersion, attemptId: request.attemptId, evidenceId: "evidence",
         ...(request.response.type === "answered" ? { correctness: "correct" } : { outcome: request.response.type }) };
+      if (result.status === "graded" && result.correctness === "correct" && result.taskId === request.taskId) providerCorrect += 1;
+      result.progress ??= { correctCount: providerCorrect,
+        wrongCount: result.status === "graded" && result.correctness === "incorrect" ? wrongCount + 1 : wrongCount,
+        completedCount: completedCount + requests.submit.length,
+        rewardSunCount: providerCorrect * 5, rewardSunValue: providerCorrect * 250 };
+      providerCorrect = result.progress.correctCount;
+      return result;
     },
     async endSession(request) {
-      ends.push(request);
-      if (end) return end(request);
-      return { schemaVersion: 1, status: "ended", sessionId: request.sessionId };
+      requests.end.push(structuredClone(request));
+      return { schemaVersion: 1, status: "ended", sessionId: request.sessionId,
+        final: { correctCount: providerCorrect, wrongCount, questionCount, passed: false,
+          reward: { grantId: "grant-1", sunCount: providerCorrect * 5 },
+          challenge: { enabled: challengeRule.enabled, ruleVersion: challengeRule.version,
+            extraPerWave: challengeRule.enabled ? Math.min(wrongCount, challengeRule.perWaveCap) : 0,
+            maxWaves: challengeRule.maxWaves, totalCap: challengeRule.totalCap } } };
     },
   };
-  const snapshot = { identity, scene: {}, positions: Array.from({ length: 5 }, () => ({})) };
-  const bridge = {
-    getLevelIdentity: () => identity,
-    getGameContext: () => ({ gameId: "pvzge", levelIds: ["1-1"], locale: "zh-CN" }),
-    hasEnded: () => !identity,
-    isEligible: () => eligible,
-    preflight: () => eligible ? { ...snapshot, identity } : null,
-    isCurrent: (value) => current && value.identity === identity,
-    isQuizActive: (value) => paused && current && value.identity === identity,
-    async pauseForQuiz() { events.push("pause"); paused = true; return true; },
-    releasePause() { events.push("release"); paused = false; },
-    award(_snapshot, attemptId) { events.push(`award:${attemptId}`); },
-  };
   const view = {
-    ask(received) { events.push("ask"); open = true; expect(received).toEqual(task); return response.finally(() => { open = false; }); },
-    dismiss(reason = "superseded") { events.push(`dismiss:${reason}`); open = false; },
-    isOpen: () => open,
+    async ask(_task, currentProgress) {
+      progress.push(structuredClone(currentProgress));
+      return answers[currentProgress.current - 1] ?? { type: "timed_out", elapsedMs: 20_000 };
+    },
+    showLoading(currentProgress, options) { loading.push({ progress: currentProgress, options }); },
+    async showResult(result, currentProgress) {
+      feedback.push({ result: structuredClone(result), progress: structuredClone(currentProgress) });
+      if (showResult) await showResult(result, currentProgress);
+      return { action: "next" };
+    },
+    dismiss(reason) { dismissals.push(reason); },
   };
-  const controller = createQuizController({ provider, bridge, view, isVisible: () => true,
-    firstDelayMs: 20_000, repeatDelayMs: 60_000, maxDeltaMs: 1_000,
-    id: (() => { let value = 0; return () => `runtime-${++value}`; })(),
-    log: { error(...args) { errors.push(args); } } });
-  return { bridge, controller, ends, errors, events, provider, submissions,
-    setCurrent(value) { current = value; }, setEligible(value) { eligible = value; },
-    setIdentity(value) { identity = value; }, setResponse(value) { response = value; } };
+  let serial = 0;
+  const controller = createQuizController({ provider, view, isVisible: () => visible,
+    id: () => `id-${++serial}`, log: { error() {} } });
+  return { controller, dismissals, feedback, loading, progress, requests,
+    setVisible(value) { visible = value; controller.setVisible(value); } };
 }
 
-async function accrue(controller, start, seconds) {
-  await controller.tick(start);
-  for (let index = 1; index <= seconds; index += 1) await controller.tick(start + index * 1_000);
-}
-
-describe("async quiz runtime", () => {
-  test("fetches a non-math task before pausing and rewards once after resumed grading", async () => {
-    const grade = deferred();
-    const harness = createHarness({ submit: () => grade.promise });
-    const ticking = accrue(harness.controller, 0, 20);
-    while (!harness.events.includes("submit-active")) await Promise.resolve();
-    expect(harness.events.slice(0, 6)).toEqual(["create", "fetch-active", "pause", "ask", "release", "submit-active"]);
-    expect(harness.events.some((entry) => entry.startsWith("award"))).toBe(false);
-    grade.resolve({ schemaVersion: 1, status: "graded", sessionId: "session-level-1", taskId: task.taskId,
-      questionId: task.questionId, questionVersion: 7, attemptId: harness.submissions[0].attemptId,
-      evidenceId: "e", correctness: "correct" });
-    await ticking;
-    expect(harness.events.filter((entry) => entry.startsWith("award"))).toHaveLength(1);
-    expect(harness.submissions[0].response).toEqual({ type: "answered", optionId: "paris", elapsedMs: 25 });
+describe("pre-level quiz batch", () => {
+  test("defaults progress to the ten-question batch", () => {
+    expect(normalizeProgress()).toEqual({ current: 1, total: 10, correctCount: 0,
+      challengeRule: null, message: undefined });
+    expect(formatProgressSummary({ correctCount: 3 })).toBe("已答对3题 · 累计奖励15个阳光（750点）");
   });
 
-  test("records timeout at zero and never converts provider failures into incorrect answers", async () => {
-    const harness = createHarness({ submit: async () => { throw new Error("offline"); } });
-    harness.setResponse(Promise.resolve({ type: "timed_out", elapsedMs: 0 }));
-    await accrue(harness.controller, 0, 20);
-    expect(harness.submissions[0].response).toEqual({ type: "timed_out", elapsedMs: 0 });
-    expect(harness.events.some((entry) => entry.startsWith("award"))).toBe(false);
+  test("uses server-confirmed progress for feedback and forwards the final challenge", async () => {
+    const challengeRule = { enabled: true, version: 2, perWaveCap: 2, maxWaves: 3, totalCap: 6 };
+    const answers = Array(7).fill(null);
+    answers.push({ type: "answered", optionId: "a", elapsedMs: 1 });
+    const h = harness({ tasks: [task(1)], questionCount: 8, completedCount: 7, correctCount: 6,
+      wrongCount: 1, challengeRule, answers,
+      submitHook: async request => ({ schemaVersion: 1, status: "graded", sessionId: request.sessionId,
+        taskId: request.taskId, questionId: request.questionId, questionVersion: request.questionVersion,
+        attemptId: request.attemptId, evidenceId: "e", correctness: "correct",
+        progress: { correctCount: 7, wrongCount: 1, completedCount: 8,
+          rewardSunCount: 35, rewardSunValue: 1750 } }) });
+    const result = await h.controller.run({ gameId: "pvzge", levelIds: ["egypt3"], locale: "zh-CN" });
+    expect(h.feedback[0].progress).toMatchObject({ correctCount: 7, wrongCount: 1,
+      rewardSunCount: 35, rewardSunValue: 1750 });
+    expect(h.loading.findLast(({ progress }) => progress.message === "正在确认学习奖励").progress.correctCount)
+      .toBe(7);
+    expect(result.challenge).toEqual({ enabled: true, ruleVersion: 2, extraPerWave: 1,
+      maxWaves: 3, totalCap: 6 });
   });
 
-  test("bounds a provider that ignores abort without pausing gameplay", async () => {
-    const harness = createHarness();
-    harness.provider.createSession = () => new Promise(() => {});
-    const controller = createQuizController({ provider: harness.provider, bridge: harness.bridge,
-      view: { ask() { throw new Error("unreachable"); }, dismiss() {}, isOpen: () => false },
-      isVisible: () => true, firstDelayMs: 1, repeatDelayMs: 60_000, maxDeltaMs: 1,
-      timeoutMs: 5, id: () => "bounded", log: { error() {} } });
-    await controller.tick(0);
-    await controller.tick(1);
-    expect(harness.events).not.toContain("pause");
+  test("exposes no periodic scheduler API", () => {
+    const h = harness();
+    expect(h.controller.tick).toBeUndefined();
   });
 
-  test("retries session creation after a provider rejection", async () => {
-    let creates = 0;
-    const gameSessionIds = [];
-    const harness = createHarness({ create: async (request) => {
-      creates += 1;
-      gameSessionIds.push(request.gameSessionId);
-      if (creates === 1) throw new Error("temporary create failure");
-      return { schemaVersion: 1, status: "active", sessionId: "recovered", learnerRef: "learner-z",
-        plan: { planId: "history", title: "历史", subjectId: "history", skillIds: ["world-capitals"] } };
-    } });
-
-    await accrue(harness.controller, 0, 20);
-    await accrue(harness.controller, 21_000, 60);
-
-    expect(creates).toBe(2);
-    expect(new Set(gameSessionIds).size).toBe(1);
-    expect(harness.events).toContain("ask");
+  test("uses dynamic counts and resumes server progress for 3 and 12 question configurations", async () => {
+    for (const questionCount of [3, 12]) {
+      const completedCount = 1;
+      const tasks = Array.from({ length: questionCount - completedCount }, (_, index) => task(index + 1));
+      const answers = tasks.map(() => ({ type: "skipped", elapsedMs: 1 }));
+      const h = harness({ tasks, answers, questionCount, completedCount, correctCount: 1 });
+      const result = await h.controller.run({ gameId: "pvzge", levelIds: ["tutorial-1"], locale: "zh-CN" });
+      expect(result.questionCount).toBe(questionCount);
+      expect(h.progress[0]).toMatchObject({ current: 2, total: questionCount, correctCount: 1,
+        wrongCount: 0, rewardSunCount: 5, rewardSunValue: 250 });
+      expect(h.requests.submit).toHaveLength(questionCount - completedCount);
+    }
   });
 
-  test("recovers when session setup throws before provider invocation", async () => {
-    const harness = createHarness();
-    harness.bridge.getGameContext = () => { throw new Error("context unavailable"); };
-    await accrue(harness.controller, 0, 20);
-    harness.bridge.getGameContext = () => ({ gameId: "pvzge", levelIds: ["1-1"], locale: "zh-CN" });
-
-    await accrue(harness.controller, 21_000, 60);
-
-    expect(harness.events).toContain("ask");
-    expect(harness.errors.length).toBeGreaterThan(0);
+  test("accepts server timeout normalization for an answer at the deadline", async () => {
+    const h = harness({ tasks: [task(1)], questionCount: 1,
+      answers: [{ type: "answered", optionId: "a", elapsedMs: 20_000 }],
+      submitHook: async request => ({ schemaVersion: 1, status: "recorded", sessionId: request.sessionId,
+        taskId: request.taskId, questionId: request.questionId, questionVersion: request.questionVersion,
+        attemptId: request.attemptId, evidenceId: "e", outcome: "timed_out" }) });
+    expect(await h.controller.run({ gameId: "pvzge", levelIds: ["1"], locale: "zh-CN" }))
+      .toMatchObject({ correctCount: 0, completed: true });
   });
 
-  test("does not continue a stale tick after awaited session cleanup", async () => {
-    const closing = deferred();
-    const harness = createHarness({ end: () => closing.promise });
-    await accrue(harness.controller, 0, 20);
-    harness.setIdentity("level-2");
-    const changing = harness.controller.tick(21_000);
-    while (harness.ends.length === 0) await Promise.resolve();
-    harness.setIdentity("level-3");
-    closing.resolve({ schemaVersion: 1, status: "ended", sessionId: "session-level-1" });
-    await changing;
+  test("runs exactly ten sequential tasks and exposes progress through the final question", async () => {
+    const tasks = Array.from({ length: 10 }, (_, index) => task(index + 1));
+    const answers = tasks.map((_, index) => ({ type: "answered", optionId: "a", elapsedMs: index + 1 }));
+    const h = harness({ tasks, answers, submitHook: async (request, count) => ({ schemaVersion: 1,
+      status: request.response.type === "answered" ? "graded" : "recorded",
+      sessionId: request.sessionId, taskId: request.taskId, questionId: request.questionId,
+      questionVersion: request.questionVersion, attemptId: request.attemptId, evidenceId: `e-${count}`,
+      ...(request.response.type === "answered" ? { correctness: "correct" } : { outcome: request.response.type }) }) });
 
-    expect(harness.events.filter((event) => event === "create")).toHaveLength(1);
-    expect(harness.events.filter((event) => event === "fetch-active")).toHaveLength(1);
+    const result = await h.controller.run({ gameId: "pvzge", levelIds: ["1", "2"], locale: "zh-CN" });
+
+    expect(result).toMatchObject({ learningSessionId: "session-1", saveId: 1, correctCount: 10,
+      questionCount: 10, reward: { grantId: "grant-1", sunCount: 50 }, completed: true, cancelled: false });
+    expect(h.requests.next).toHaveLength(10);
+    expect(h.requests.submit).toHaveLength(10);
+    expect(h.progress.map(({ current, total, correctCount }) => ({ current, total, correctCount })))
+      .toEqual(tasks.map((_, index) => ({ current: index + 1, total: 10, correctCount: index })));
+    expect(h.requests.end[0].reason).toBe("game_ended");
   });
 
-  test("keeps the new level first delay when an old grade settles late", async () => {
-    const grade = deferred();
-    const harness = createHarness({ submit: () => grade.promise });
-    const oldLevel = accrue(harness.controller, 0, 20);
-    while (!harness.events.includes("submit-active")) await Promise.resolve();
-    harness.setIdentity("level-2");
-    await harness.controller.tick(21_000);
-    const submission = harness.submissions[0];
-    grade.resolve({ schemaVersion: 1, status: "graded", sessionId: submission.sessionId,
-      taskId: submission.taskId, questionId: submission.questionId, questionVersion: submission.questionVersion,
-      attemptId: submission.attemptId, evidenceId: "late-grade", correctness: "correct" });
-    await oldLevel;
-
-    await accrue(harness.controller, 22_000, 18);
-    expect(harness.events.filter((event) => event === "ask")).toHaveLength(1);
-    await harness.controller.tick(41_000);
-
-    expect(harness.events.filter((event) => event === "ask")).toHaveLength(2);
+  test("does not treat premature no_task as completion", async () => {
+    const h = harness({ tasks: [] });
+    const running = h.controller.run({ gameId: "pvzge", levelIds: ["custom-1"], locale: "zh-CN" });
+    while (!h.loading.some(({ options }) => options.onRetry)) await Promise.resolve();
+    h.loading.findLast(({ options }) => options.onRetry).options.onCancel();
+    expect((await running).completed).toBe(false);
   });
 
-  test("keeps a delayed fetched task pending when the page becomes hidden", async () => {
-    const fetched = deferred();
-    const harness = createHarness({ nextTask: () => fetched.promise });
-    const ticking = accrue(harness.controller, 0, 20);
-    while (!harness.events.includes("fetch-active")) await Promise.resolve();
-    harness.controller.setVisible(false);
-    fetched.resolve({ schemaVersion: 1, status: "task", task });
-    await ticking;
+  test("counts incorrect answers and timeouts as zero reward", async () => {
+    const h = harness({
+      tasks: [task(1), task(2)],
+      answers: [
+        { type: "answered", optionId: "b", elapsedMs: 10 },
+        { type: "timed_out", elapsedMs: 20_000 },
+      ],
+      submitHook: async (request) => ({ schemaVersion: 1,
+        status: request.response.type === "answered" ? "graded" : "recorded",
+        sessionId: request.sessionId, taskId: request.taskId, questionId: request.questionId,
+        questionVersion: request.questionVersion, attemptId: request.attemptId, evidenceId: "evidence",
+        ...(request.response.type === "answered" ? { correctness: "incorrect" } : { outcome: "timed_out" }) }),
+    });
 
-    expect(harness.events).not.toContain("pause");
-    expect(harness.submissions).toHaveLength(0);
+    const result = await h.controller.run({ gameId: "pvzge", levelIds: ["1"], locale: "zh-CN" });
+
+    expect(result).toMatchObject({ correctCount: 0, questionCount: 2, completed: true, cancelled: false });
+    expect(h.requests.submit.map(({ response }) => response.type)).toEqual(["answered", "timed_out"]);
+    expect(h.feedback.map(({ result }) => result.status === "graded" ? result.correctness : result.outcome))
+      .toEqual(["incorrect", "timed_out"]);
   });
 
-  test("rejects a correlated result with the wrong task identity", async () => {
-    const harness = createHarness({ submit: async (request) => ({ schemaVersion: 1, status: "graded",
-      sessionId: request.sessionId, taskId: "other-task", questionId: request.questionId,
-      questionVersion: request.questionVersion, attemptId: request.attemptId, evidenceId: "e", correctness: "correct" }) });
-    await accrue(harness.controller, 0, 20);
-    expect(harness.events.some((entry) => entry.startsWith("award"))).toBe(false);
+  test("shows accepted correct, wrong, timeout, and skip results once before requesting the next task", async () => {
+    const gates = Array.from({ length: 4 }, deferred);
+    const events = [];
+    const intents = [
+      { type: "answered", optionId: "a", elapsedMs: 1 },
+      { type: "answered", optionId: "b", elapsedMs: 2 },
+      { type: "timed_out", elapsedMs: 20_000 },
+      { type: "skipped", elapsedMs: 3 },
+    ];
+    const h = harness({ tasks: intents.map((_, index) => task(index + 1)), answers: intents,
+      showResult: async (_result, progress) => { events.push(`result-${progress.current}`); await gates[progress.current - 1].promise; },
+      submitHook: async (request, count) => ({ schemaVersion: 1,
+        status: request.response.type === "answered" ? "graded" : "recorded",
+        sessionId: request.sessionId, taskId: request.taskId, questionId: request.questionId,
+        questionVersion: request.questionVersion, attemptId: request.attemptId, evidenceId: `e-${count}`,
+        ...(request.response.type === "answered"
+          ? { correctness: count === 1 ? "correct" : "incorrect" }
+          : { outcome: request.response.type }) }) });
+    const running = h.controller.run({ gameId: "pvzge", levelIds: ["1"], locale: "zh-CN" });
+    for (let index = 0; index < gates.length; index += 1) {
+      while (h.feedback.length <= index) await Promise.resolve();
+      expect(h.requests.next).toHaveLength(index + 1);
+      gates[index].resolve();
+    }
+    await running;
+    expect(events).toEqual(["result-1", "result-2", "result-3", "result-4"]);
+    expect(h.feedback.map(({ result }) => result.status === "graded" ? result.correctness : result.outcome))
+      .toEqual(["correct", "incorrect", "timed_out", "skipped"]);
   });
 
-  test("scene invalidation dismisses and submits cancelled evidence exactly once", async () => {
-    const answer = deferred();
-    const harness = createHarness();
-    harness.setResponse(answer.promise);
-    const ticking = accrue(harness.controller, 0, 20);
-    while (!harness.events.includes("ask")) await Promise.resolve();
-    harness.setCurrent(false);
-    const invalidation = harness.controller.tick(21_000);
-    answer.resolve({ type: "cancelled", reason: "scene_changed", elapsedMs: 12 });
-    await Promise.all([ticking, invalidation]);
-    expect(harness.events).toContain("dismiss:scene_changed");
-    expect(harness.submissions).toHaveLength(1);
-    expect(harness.submissions[0].response.type).toBe("cancelled");
-    expect(harness.events.some((entry) => entry.startsWith("award"))).toBe(false);
+  test("requires an explicit next action after accepted feedback", async () => {
+    const next = deferred();
+    const h = harness({ tasks: [task(1)], questionCount: 1,
+      answers: [{ type: "answered", optionId: "a", elapsedMs: 1 }],
+      showResult: () => next.promise });
+    const running = h.controller.run({ gameId: "pvzge", levelIds: ["1"], locale: "zh-CN" });
+    while (h.feedback.length === 0) await Promise.resolve();
+    expect(h.requests.end).toHaveLength(0);
+    let settled = false;
+    running.finally(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    next.resolve();
+    expect((await running).completed).toBe(true);
   });
 
-  test("defers a fetched task without pausing when planting is transiently ineligible", async () => {
-    const harness = createHarness();
-    const original = harness.provider.getNextTask;
-    harness.provider.getNextTask = async (...args) => { const value = await original(...args); harness.setEligible(false); return value; };
-    await accrue(harness.controller, 0, 20);
-    expect(harness.events).toEqual(["create", "fetch-active"]);
-    harness.setEligible(true);
-    await harness.controller.tick(21_000);
-    expect(harness.events.filter((entry) => entry === "fetch-active")).toHaveLength(1);
-    expect(harness.events).toContain("ask");
+  test("keeps grading failures in loading state and shows no false correctness before a valid retry", async () => {
+    const accepted = deferred();
+    const h = harness({ tasks: [task(1)], answers: [{ type: "answered", optionId: "a", elapsedMs: 1 }],
+      showResult: () => accepted.promise,
+      submitHook: async (request, count) => count === 1
+        ? { schemaVersion: 1, status: "graded", sessionId: request.sessionId, taskId: "stale",
+          questionId: request.questionId, questionVersion: request.questionVersion,
+          attemptId: request.attemptId, evidenceId: "bad", correctness: "incorrect" }
+        : { schemaVersion: 1, status: "graded", sessionId: request.sessionId, taskId: request.taskId,
+          questionId: request.questionId, questionVersion: request.questionVersion,
+          attemptId: request.attemptId, evidenceId: "good", correctness: "correct" } });
+    const running = h.controller.run({ gameId: "pvzge", levelIds: ["1"], locale: "zh-CN" });
+    while (!h.loading.some(({ options }) => options.onRetry)) await Promise.resolve();
+    expect(h.feedback).toHaveLength(0);
+    expect(h.loading.some(({ progress }) => progress.message === "正在判题")).toBe(true);
+    expect(h.loading.findLast(({ options }) => options.onRetry).progress.message)
+      .toBe("学习服务暂不可用，可取消练习进入游戏");
+    h.loading.findLast(({ options }) => options.onRetry).options.onRetry();
+    while (h.feedback.length === 0) await Promise.resolve();
+    expect(h.feedback[0].result.correctness).toBe("correct");
+    accepted.resolve();
+    await running;
   });
 
-  test("no_task waits for the regular cooldown and session closes once on level end", async () => {
-    let fetches = 0;
-    const harness = createHarness({ nextTask: () => { fetches += 1; return { schemaVersion: 1, status: "no_task" }; } });
-    await accrue(harness.controller, 0, 20);
-    await accrue(harness.controller, 21_000, 59);
-    expect(fetches).toBe(1);
-    await harness.controller.tick(81_000);
-    expect(fetches).toBe(2);
-    harness.setIdentity(null);
-    await harness.controller.tick(82_000);
-    await harness.controller.stop();
-    expect(harness.ends).toHaveLength(1);
+  test("waits for final feedback before ending the session and stop dismisses a pending result", async () => {
+    const feedbackGate = deferred();
+    const h = harness({ tasks: [task(1)], answers: [{ type: "answered", optionId: "a", elapsedMs: 1 }],
+      showResult: () => feedbackGate.promise });
+    const running = h.controller.run({ gameId: "pvzge", levelIds: ["1"], locale: "zh-CN" });
+    while (h.feedback.length === 0) await Promise.resolve();
+    expect(h.requests.end).toHaveLength(0);
+    h.controller.stop();
+    feedbackGate.resolve();
+    expect(await running).toMatchObject({ completed: false, cancelled: true, reason: "stopped" });
+    expect(h.feedback).toHaveLength(1);
+    expect(h.dismissals).toContain("stopped");
+    expect(h.requests.end).toHaveLength(1);
+    expect(h.requests.end[0].reason).toBe("abandoned");
   });
 
-  test("reports a failed session close without rejecting the scheduler", async () => {
-    const harness = createHarness({ end: async () => { throw new Error("close failed"); } });
-    await accrue(harness.controller, 0, 20);
-    harness.setIdentity(null);
+  test("page lifecycle suspension settles locally without submitting or ending the resumable session", async () => {
+    let resolveQuestion;
+    const requests = { submit: [], end: [] };
+    const provider = {
+      async createSession() { return { schemaVersion: 1, status: "active", sessionId: "session-1",
+        learnerRef: "learner", plan: { planId: "p", title: "P", subjectId: "math", skillIds: ["addition"] },
+        questionCount: 15, completedCount: 6, correctCount: 6, wrongCount: 0, saveId: 7,
+        configurationVersion: 1 }; },
+      async getNextTask() { return { schemaVersion: 1, status: "task", task: task(7) }; },
+      async submitAnswer(request) { requests.submit.push(request); throw new Error("must not submit"); },
+      async endSession(request) { requests.end.push(request); throw new Error("must not end"); },
+    };
+    const view = { showLoading() {}, showResult() {},
+      ask() { return new Promise((resolve) => { resolveQuestion = resolve; }); },
+      dismiss(reason) { if (reason === "pagehide") resolveQuestion?.({ type: "cancelled", reason: "hidden", elapsedMs: 0 }); } };
+    const controller = createQuizController({ provider, view, id: () => "stable", log: { error() {} } });
+    const running = controller.run({ gameId: "pvzge", levelIds: ["1"], locale: "zh-CN" });
+    while (!resolveQuestion) await Promise.resolve();
 
-    await harness.controller.tick(21_000);
+    controller.suspend();
 
-    expect(harness.ends).toHaveLength(1);
-    expect(harness.errors.some(([, error]) => error?.message === "close failed")).toBe(true);
+    expect(await running).toMatchObject({ completed: false, suspended: true, reason: "pagehide" });
+    expect(requests.submit).toHaveLength(0);
+    expect(requests.end).toHaveLength(0);
+  });
+
+  test("retries a mismatched grade with the exact same attempt payload", async () => {
+    let retry;
+    const h = harness({ tasks: [task(1)], answers: [{ type: "answered", optionId: "a", elapsedMs: 1 }],
+      submitHook: async (request, count) => count === 1
+        ? { schemaVersion: 1, status: "graded", sessionId: request.sessionId, taskId: "wrong",
+          questionId: request.questionId, questionVersion: 1, attemptId: request.attemptId,
+          evidenceId: "bad", correctness: "correct" }
+        : { schemaVersion: 1, status: "graded", sessionId: request.sessionId, taskId: request.taskId,
+          questionId: request.questionId, questionVersion: 1, attemptId: request.attemptId,
+          evidenceId: "good", correctness: "correct" } });
+    const running = h.controller.run({ gameId: "pvzge", levelIds: ["1"], locale: "zh-CN" });
+    while (!h.loading.some(({ options }) => options.onRetry)) await Promise.resolve();
+    retry = h.loading.findLast(({ options }) => options.onRetry).options.onRetry;
+    retry();
+    const result = await running;
+    expect(result.correctCount).toBe(1);
+    expect(h.requests.submit[1]).toEqual(h.requests.submit[0]);
+  });
+
+  test("only explicit cancellation lets a pending provider call finish the gate", async () => {
+    const pending = deferred();
+    const view = { showLoading(_progress, options) { queueMicrotask(options.onCancel); }, dismiss() {}, ask() {} };
+    const provider = { createSession: () => pending.promise, getNextTask() {}, submitAnswer() {}, endSession() {} };
+    const controller = createQuizController({ provider, view, id: () => "stable", log: { error() {} } });
+    expect(await controller.run({ gameId: "pvzge", levelIds: ["1"], locale: "zh-CN" }))
+      .toMatchObject({ correctCount: 0, completed: false, cancelled: true, reason: "user" });
+  });
+
+  test("hidden and stopped controllers never complete a transition", async () => {
+    const pending = deferred();
+    const view = { showLoading() {}, dismiss() {}, ask() {} };
+    const provider = { createSession: () => pending.promise, getNextTask() {}, submitAnswer() {}, endSession() {} };
+    const hidden = createQuizController({ provider, view, id: () => "hidden", log: { error() {} } });
+    const hiddenRun = hidden.run({ gameId: "pvzge", levelIds: ["1"], locale: "zh-CN" });
+    hidden.setVisible(false);
+    let hiddenSettled = false;
+    hiddenRun.finally(() => { hiddenSettled = true; });
+    await Promise.resolve();
+    expect(hiddenSettled).toBe(false);
+    hidden.stop();
+    expect((await hiddenRun).completed).toBe(false);
+    const stopped = createQuizController({ provider, view, id: () => "stopped", log: { error() {} } });
+    const stoppedRun = stopped.run({ gameId: "pvzge", levelIds: ["1"], locale: "zh-CN" });
+    stopped.stop();
+    expect((await stoppedRun).cancelled).toBe(true);
+  });
+
+  test("same-turn hide and show wakes a dismissed question", async () => {
+    let activeAnswer;
+    let asks = 0;
+    const view = {
+      ask(_task, progress) {
+        asks += 1;
+        if (asks > 1) return Promise.resolve({ type: "answered", optionId: "a", elapsedMs: progress.current });
+        return new Promise((resolve) => { activeAnswer = resolve; });
+      },
+      showLoading() {},
+      async showResult() { return { action: "next" }; },
+      dismiss(reason) {
+        if (reason === "hidden" && activeAnswer) {
+          const resolve = activeAnswer;
+          activeAnswer = null;
+          resolve({ type: "cancelled", reason: "hidden", elapsedMs: 0 });
+        }
+      },
+    };
+    let serial = 0;
+    let submitted = 0;
+    const controller = createQuizController({ provider: {
+      createSession: async () => ({ schemaVersion: 1, status: "active", sessionId: "s",
+        learnerRef: "l", plan: { planId: "p", title: "p", subjectId: "m", skillIds: ["a"] },
+        questionCount: 10, completedCount: 0, correctCount: 0, wrongCount: 0,
+        challengeRule: { enabled: false, version: 0, perWaveCap: 2, maxWaves: 3, totalCap: 6 },
+        saveId: 1, configurationVersion: 1 }),
+      getNextTask: async request => ({ schemaVersion: 1, status: "task", task: task(request.requestId) }),
+      submitAnswer: async request => {
+        submitted += 1;
+        return { schemaVersion: 1, status: "graded", sessionId: request.sessionId,
+          taskId: request.taskId, questionId: request.questionId, questionVersion: request.questionVersion,
+          attemptId: request.attemptId, evidenceId: "e", correctness: "correct",
+          progress: { correctCount: submitted, wrongCount: 0, completedCount: submitted,
+            rewardSunCount: submitted * 5, rewardSunValue: submitted * 250 } };
+      },
+      endSession: async request => ({ schemaVersion: 1, status: "ended", sessionId: request.sessionId,
+        final: { correctCount: 10, questionCount: 10, passed: true, reward: { grantId: "g", sunCount: 50 } } }),
+    }, view, id: () => `wake-${++serial}`, log: { error() {} } });
+    const running = controller.run({ gameId: "pvzge", levelIds: ["1"], locale: "zh-CN" });
+    while (!activeAnswer) await Promise.resolve();
+    controller.setVisible(false);
+    controller.setVisible(true);
+    const result = await running;
+    expect(result).toMatchObject({ correctCount: 10, questionCount: 10, completed: true, cancelled: false });
+    expect(asks).toBe(11);
+  });
+
+  test("visibility-aborted provider request resumes automatically without retry UI", async () => {
+    const requests = [];
+    const loading = [];
+    let createCalls = 0;
+    const provider = {
+      createSession(request, { signal }) {
+        requests.push(structuredClone(request));
+        createCalls += 1;
+        if (createCalls > 1) return Promise.resolve({ schemaVersion: 1, status: "active", sessionId: "s",
+          learnerRef: "l", plan: { planId: "p", title: "p", subjectId: "m", skillIds: ["a"] },
+          questionCount: 1, completedCount: 1, correctCount: 0, wrongCount: 0,
+          challengeRule: { enabled: false, version: 0, perWaveCap: 2, maxWaves: 3, totalCap: 6 },
+          saveId: 1, configurationVersion: 1 });
+        return new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+      },
+      getNextTask: async () => ({ schemaVersion: 1, status: "no_task" }),
+      submitAnswer() {},
+      endSession: async request => ({ schemaVersion: 1, status: "ended", sessionId: request.sessionId,
+        final: { correctCount: 0, questionCount: 1, passed: false, reward: { grantId: "g", sunCount: 0 } } }),
+    };
+    const controller = createQuizController({ provider, view: {
+      ask() {}, dismiss() {}, showLoading(progress, options) { loading.push({ progress, options }); },
+    }, id: () => "stable", log: { error() { throw new Error("visibility abort logged as provider failure"); } } });
+    const running = controller.run({ gameId: "pvzge", levelIds: ["1"], locale: "zh-CN" });
+    while (createCalls === 0) await Promise.resolve();
+    controller.setVisible(false);
+    controller.setVisible(true);
+    expect(await running).toMatchObject({ correctCount: 0, questionCount: 1, completed: true, cancelled: false });
+    expect(requests[1]).toEqual(requests[0]);
+    expect(loading.some(({ options }) => options.onRetry)).toBe(false);
+  });
+
+  test("hidden after get-next resolves waits and asks the same issued task when visible", async () => {
+    const ready = deferred();
+    const asks = [];
+    const requests = { next: [], submit: [], end: [] };
+    let visible = true;
+    const provider = {
+      async createSession() { return { schemaVersion: 1, status: "active", sessionId: "session-1",
+        learnerRef: "learner", plan: { planId: "p", title: "P", subjectId: "math", skillIds: ["addition"] },
+        questionCount: 1, completedCount: 0, correctCount: 0, wrongCount: 0, saveId: 7,
+        configurationVersion: 1 }; },
+      async getNextTask(request) {
+        requests.next.push(structuredClone(request));
+        visible = false;
+        return { schemaVersion: 1, status: "task", task: task(7) };
+      },
+      async submitAnswer(request) { requests.submit.push(structuredClone(request)); return {
+        schemaVersion: 1, status: "graded", sessionId: request.sessionId, taskId: request.taskId,
+        questionId: request.questionId, questionVersion: request.questionVersion, attemptId: request.attemptId,
+        evidenceId: "e", correctness: "correct", progress: { correctCount: 1, wrongCount: 0,
+          completedCount: 1, rewardSunCount: 5, rewardSunValue: 250 } }; },
+      async endSession(request) { requests.end.push(structuredClone(request)); return { schemaVersion: 1,
+        status: "ended", sessionId: request.sessionId, final: { correctCount: 1, wrongCount: 0,
+          questionCount: 1, passed: true, reward: { grantId: "g", sunCount: 5 } } }; },
+    };
+    const view = { showLoading() {}, dismiss(reason) { if (reason === "ready") ready.resolve(); },
+      async ask(issuedTask) { asks.push(issuedTask.taskId); return { type: "answered", optionId: "a", elapsedMs: 1 }; },
+      async showResult() { return { action: "next" }; } };
+    const controller = createQuizController({ provider, view, isVisible: () => visible,
+      id: () => "stable", log: { error() {} } });
+    const running = controller.run({ gameId: "pvzge", levelIds: ["1"], locale: "zh-CN" });
+    await ready.promise;
+    expect(asks).toHaveLength(0);
+    expect(requests.submit).toHaveLength(0);
+    expect(requests.end).toHaveLength(0);
+
+    visible = true;
+    controller.setVisible(true);
+    expect(await running).toMatchObject({ completed: true, correctCount: 1 });
+    expect(asks).toEqual(["task-7"]);
+    expect(requests.next).toHaveLength(1);
+    expect(requests.submit).toHaveLength(1);
+    expect(requests.end).toHaveLength(1);
   });
 });

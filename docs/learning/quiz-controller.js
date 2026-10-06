@@ -1,15 +1,24 @@
 import { callProvider, createRequestFactory, PROVIDER_TIMEOUT_MS } from "./learning-session.js";
-import { parseSession, parseSubmissionResult, parseTaskResponse } from "./provider.js";
-
-const DEFAULT_FIRST_DELAY = 20_000;
-const DEFAULT_REPEAT_DELAY = 60_000;
-const DEFAULT_MAX_DELTA = 1_000;
+import { parseEndSessionResult, parseSession, parseSubmissionResult, parseTaskResponse } from "./provider.js";
+import { createQuizControllerLifecycle } from "./quiz-controller-lifecycle.js";
 
 function validIntent(value, task) {
   if (!value || !Number.isSafeInteger(value.elapsedMs) || value.elapsedMs < 0) return false;
-  if (value.type === "answered") return task.options.some(({ optionId }) => optionId === value.optionId);
-  if (value.type === "timed_out" || value.type === "skipped") return true;
-  return value.type === "cancelled" && ["scene_changed", "hidden", "stopped", "superseded"].includes(value.reason);
+  if (task.kind === "single_choice") {
+    if (value.type === "answered") return task.options.some(({ optionId }) => optionId === value.optionId);
+    return value.type === "timed_out" || value.type === "skipped";
+  }
+  if (task.kind === "numeric_entry" && value.type === "entered") {
+    const arity = ["fraction", "pair"].includes(task.inputSpec.format) ? 2 : 1;
+    if (!Array.isArray(value.values) || value.values.length !== arity ||
+      value.values.some((field) => typeof field !== "string" || field.length < 1 || field.length > 16)) return false;
+    if (task.inputSpec.format === "decimal") return /^[0-9]+(?:\.[0-9]+)?$/.test(value.values[0]);
+    if (["integer", "digits", "pair"].includes(task.inputSpec.format)) {
+      return value.values.every((field) => /^[0-9]+$/.test(field));
+    }
+    return /^-?[0-9]+$/.test(value.values[0]) && /^0*[1-9][0-9]*$/.test(value.values[1]);
+  }
+  return value.type === "timed_out" || value.type === "skipped";
 }
 
 function matches(result, request) {
@@ -20,210 +29,154 @@ function matches(result, request) {
 
 export function createQuizController({
   provider,
-  bridge,
   view,
   isVisible = () => typeof document === "undefined" || document.visibilityState === "visible",
-  firstDelayMs = DEFAULT_FIRST_DELAY,
-  repeatDelayMs = DEFAULT_REPEAT_DELAY,
-  maxDeltaMs = DEFAULT_MAX_DELTA,
   timeoutMs = PROVIDER_TIMEOUT_MS,
   id = () => crypto.randomUUID(),
   log = console,
 }) {
-  if (!provider || ["createSession", "getNextTask", "submitAnswer", "endSession"].some((name) => typeof provider[name] !== "function")) {
+  if (!provider || ["createSession", "getNextTask", "submitAnswer", "endSession"]
+    .some((name) => typeof provider[name] !== "function")) {
     throw new TypeError("provider must implement the learning provider contract");
   }
   const requestId = createRequestFactory(id);
-  let identity = null;
-  let lifecycle = null;
-  let elapsed = 0;
-  let delay = firstDelayMs;
-  let lastNow = null;
-  let busy = false;
-  let activeAttempt = null;
-  let activeRun = null;
-  let stopped = false;
-  let visible = true;
-  let gameSessionId = null;
-  let lifecycleGeneration = 0;
+  const lifecycle = createQuizControllerLifecycle({ view, isVisible, timeoutMs, log });
 
-  const report = (message, error) => log.error(`[quiz] ${message}`, error);
-
-  async function endLifecycle(entry, reason) {
-    if (!entry || entry.closePromise) return entry?.closePromise;
-    entry.controller.abort();
-    entry.closePromise = entry.sessionPromise.then(async (session) => {
-      if (!session) return;
-      const request = { schemaVersion: 1, requestId: requestId("end"), sessionId: session.sessionId, reason };
-      try { await callProvider(provider.endSession.bind(provider), request, { timeoutMs }); }
-      catch (error) { report("Failed to end learning session", error); }
-    }).catch((error) => {
-      if (error?.name !== "AbortError") report("Failed to close learning session", error);
-    });
-    return entry.closePromise;
-  }
-
-  function invalidate(reason) {
-    if (!activeAttempt || activeAttempt.invalidated) return;
-    activeAttempt.invalidated = true;
-    activeAttempt.cancelReason = reason;
-    if (view.isOpen()) view.dismiss(reason);
-  }
-
-  async function changeIdentity(nextIdentity) {
-    if (nextIdentity === identity) return;
-    const previous = lifecycle;
-    invalidate("scene_changed");
-    lifecycleGeneration += 1;
-    identity = nextIdentity;
-    gameSessionId = nextIdentity ? requestId("game") : null;
-    lifecycle = null;
-    elapsed = 0;
-    delay = firstDelayMs;
-    lastNow = null;
-    if (previous) await endLifecycle(previous, nextIdentity ? "replaced" : "game_ended");
-  }
-
-  function startLifecycle(expectedIdentity) {
-    const controller = new AbortController();
-    const entry = { identity: expectedIdentity, controller, closePromise: null, pendingTask: null, ended: false };
-    const request = { schemaVersion: 1, requestId: requestId("create"), gameSessionId,
-      gameContext: bridge.getGameContext() };
-    entry.sessionPromise = callProvider(provider.createSession.bind(provider), request, {
-      signal: controller.signal,
-      timeoutMs,
-      onLateValue: (value) => {
-        try {
-          const session = parseSession(value);
-          const end = { schemaVersion: 1, requestId: requestId("end-late"), sessionId: session.sessionId, reason: "abandoned" };
-          callProvider(provider.endSession.bind(provider), end, { timeoutMs }).catch((error) => report("Failed to clean up late session", error));
-        } catch (error) { report("Ignored malformed late session", error); }
-      },
-    }).then(parseSession).catch((error) => {
-      if (lifecycle === entry) lifecycle = null;
-      throw error;
-    });
-    lifecycle = entry;
-    return entry;
-  }
-
-  async function getTask(entry) {
-    if (entry.pendingTask) return entry.pendingTask;
-    const session = await entry.sessionPromise;
-    const response = parseTaskResponse(await callProvider(provider.getNextTask.bind(provider), {
-      schemaVersion: 1, requestId: requestId("next"), sessionId: session.sessionId,
-    }, { signal: entry.controller.signal, timeoutMs }));
-    if (response.status === "task") entry.pendingTask = response.task;
-    if (response.status === "session_ended") entry.ended = true;
-    return entry.pendingTask;
-  }
-
-  async function submit(entry, task, attemptId, response) {
-    const session = await entry.sessionPromise;
-    const request = { schemaVersion: 1, sessionId: session.sessionId, taskId: task.taskId,
-      questionId: task.questionId, questionVersion: task.questionVersion, attemptId, response };
-    const result = parseSubmissionResult(await callProvider(provider.submitAnswer.bind(provider), request, { timeoutMs }));
-    if (!matches(result, request)) throw new Error("Submission result identity mismatch");
-    if (response.type === "answered" ? result.status !== "graded" : result.status !== "recorded" || result.outcome !== response.type) {
-      throw new Error("Submission result status mismatch");
-    }
-    return result;
-  }
-
-  async function runQuiz(expectedIdentity) {
-    const run = {};
-    const runGeneration = lifecycleGeneration;
-    busy = true;
-    activeRun = run;
-    let entry;
-    let snapshot;
-    let attempt;
-    let ownsPause = false;
-    try {
-      entry = lifecycle ?? startLifecycle(expectedIdentity);
-      const task = await getTask(entry);
-      if (!task || entry.ended) return;
-      snapshot = bridge.preflight();
-      if (stopped || identity !== expectedIdentity || !snapshot || !visible || !isVisible()) return;
-      const attemptId = requestId("attempt");
-      attempt = { attemptId, entry, snapshot, task, invalidated: false, cancelReason: null };
-      activeAttempt = attempt;
-      ownsPause = await bridge.pauseForQuiz(snapshot);
-      if (!ownsPause) return;
-      if (stopped || identity !== expectedIdentity || !visible || !isVisible() || !bridge.isCurrent(snapshot)) {
-        entry.pendingTask = null;
-        bridge.releasePause(snapshot);
-        ownsPause = false;
-        await submit(entry, task, attemptId, {
-          type: "cancelled", reason: attempt.cancelReason ?? "scene_changed", elapsedMs: 0,
-        });
-        return;
-      }
-      let response = await view.ask(task);
-      if (attempt.invalidated) response = {
-        type: "cancelled",
-        reason: attempt.cancelReason ?? "superseded",
-        elapsedMs: Number.isSafeInteger(response?.elapsedMs) && response.elapsedMs >= 0 ? response.elapsedMs : 0,
+  async function closeSession(session, state, complete, progress) {
+    if (!session) return null;
+    if (state.suspended) return null;
+    const request = { schemaVersion: 1, requestId: requestId("end"), sessionId: session.sessionId,
+      reason: state.cancelled || lifecycle.stopped() ? "abandoned" : complete ? "game_ended" : "stopped" };
+    const parse = (value) => {
+        const result = parseEndSessionResult(value);
+        if (result.sessionId !== session.sessionId) throw new Error("End-session identity mismatch");
+        if (result.final.questionCount !== session.questionCount) throw new Error("End-session question count mismatch");
+        return result;
       };
-      if (!validIntent(response, task)) throw new TypeError("Quiz view returned an invalid response intent");
-      entry.pendingTask = null;
-      bridge.releasePause(snapshot);
-      ownsPause = false;
-      const result = await submit(entry, task, attemptId, response);
-      if (response.type === "answered" && result.correctness === "correct" && !attempt.invalidated &&
-        !stopped && identity === expectedIdentity && visible && isVisible() && bridge.isCurrent(snapshot)) {
-        bridge.award(snapshot, attemptId);
+    if (state.cancelled || lifecycle.stopped()) {
+      try { return parse(await callProvider(provider.endSession.bind(provider), request, { timeoutMs })); }
+      catch (error) { log.error("[quiz] Partial session finalization failed", error); return null; }
+    }
+    return lifecycle.retryable(provider.endSession.bind(provider), request,
+      { ...progress, current: session.questionCount, total: session.questionCount,
+        message: "正在确认学习奖励" }, state, parse);
+  }
+
+  async function execute(gameContext, state) {
+    let session = null;
+    let correctCount = 0;
+    let wrongCount = 0;
+    let completedCount = 0;
+    let rewardSunCount = 0;
+    let rewardSunValue = 0;
+    let complete = false;
+    let finalResult = null;
+    try {
+      const createRequest = { schemaVersion: 1, requestId: requestId("create"),
+        gameSessionId: requestId("game"), gameContext };
+      session = await lifecycle.retryable(provider.createSession.bind(provider), createRequest,
+        { current: 1, total: 10, correctCount }, state, parseSession);
+      if (!session) return { correctCount: 0, questionCount: 0, completed: false,
+        cancelled: state.cancelled || lifecycle.stopped(), ...(state.reason ? { reason: state.reason } : {}) };
+      const questionCount = session.questionCount ?? 10;
+      completedCount = session.completedCount ?? 0;
+      correctCount = session.correctCount ?? 0;
+      wrongCount = session.wrongCount ?? 0;
+      rewardSunCount = correctCount * 5;
+      rewardSunValue = rewardSunCount * 50;
+      if (completedCount === 0 && session.stageCard) {
+        if (!lifecycle.available()) await lifecycle.waitUntilVisible(state);
+        if (!lifecycle.terminal(state)) {
+          const cardProgress = { current: 1, total: questionCount, correctCount, wrongCount,
+            rewardSunCount, rewardSunValue, challengeRule: session.challengeRule };
+          let cardAction = await view.showStageCard(session.stageCard, cardProgress);
+          while (cardAction?.action === "dismissed" && cardAction.reason === "hidden" &&
+            !lifecycle.terminal(state)) {
+            await lifecycle.waitUntilVisible(state);
+            if (!lifecycle.terminal(state)) cardAction = await view.showStageCard(session.stageCard, cardProgress);
+          }
+          if (cardAction?.action !== "start" && !lifecycle.terminal(state)) {
+            throw new TypeError("Quiz view returned an invalid stage-card intent");
+          }
+        }
       }
-    } catch (error) {
-      report("Learning operation failed", error);
+      for (; completedCount < questionCount && !lifecycle.terminal(state);) {
+        const progress = { current: completedCount + 1, total: questionCount, correctCount,
+          wrongCount, rewardSunCount, rewardSunValue, challengeRule: session.challengeRule };
+        const nextRequest = { schemaVersion: 1, requestId: requestId("next"), sessionId: session.sessionId };
+        const response = await lifecycle.retryable(provider.getNextTask.bind(provider), nextRequest, progress,
+          state, parseTaskResponse);
+        if (!response) break;
+        if (response.status !== "task") {
+          if (response.status === "no_task" && completedCount < questionCount) {
+            throw new Error("Learning provider ended tasks before reported progress completed");
+          }
+          complete = completedCount >= questionCount;
+          break;
+        }
+        view.dismiss("ready");
+        if (!lifecycle.available() && !await lifecycle.waitUntilVisible(state)) break;
+        let intent = await view.ask(response.task, progress);
+        while (intent?.type === "cancelled" && intent.reason === "hidden" &&
+          !lifecycle.terminal(state)) {
+          await lifecycle.waitUntilVisible(state);
+          if (!lifecycle.terminal(state)) intent = await view.ask(response.task, progress);
+        }
+        if (lifecycle.terminal(state)) break;
+        if (!validIntent(intent, response.task)) throw new TypeError("Quiz view returned an invalid response intent");
+        const submitRequest = { schemaVersion: 1, sessionId: session.sessionId,
+          taskId: response.task.taskId, questionId: response.task.questionId,
+          questionVersion: response.task.questionVersion, attemptId: requestId("attempt"), response: intent };
+        const result = await lifecycle.retryable(provider.submitAnswer.bind(provider), submitRequest,
+          { ...progress, message: "正在判题" },
+          state, (value) => {
+            const parsed = parseSubmissionResult(value, response.task.kind);
+            if (!matches(parsed, submitRequest)) throw new Error("Submission result identity mismatch");
+            const validStatus = ["answered", "entered"].includes(intent.type) ? (parsed.status === "graded" ||
+              (parsed.status === "recorded" && parsed.outcome === "timed_out")) :
+              parsed.status === "recorded" && parsed.outcome === intent.type;
+            if (!validStatus) throw new Error("Submission result status mismatch");
+            return parsed;
+          });
+        if (!result || lifecycle.terminal(state)) break;
+        ({ correctCount, wrongCount, completedCount, rewardSunCount, rewardSunValue } = result.progress);
+        let continuation = await view.showResult(result, { ...progress, correctCount, wrongCount,
+          rewardSunCount, rewardSunValue });
+        while (continuation?.action === "dismissed" && continuation.reason === "hidden" &&
+          !lifecycle.terminal(state)) {
+          await lifecycle.waitUntilVisible(state);
+          if (!lifecycle.terminal(state)) {
+            continuation = await view.showResult(result, { ...progress, correctCount, wrongCount,
+              rewardSunCount, rewardSunValue });
+          }
+        }
+        if (continuation?.action !== "next" && !lifecycle.terminal(state)) {
+          throw new TypeError("Quiz view returned an invalid continuation intent");
+        }
+        if (lifecycle.terminal(state)) break;
+      }
+      complete = completedCount >= questionCount;
+      finalResult = await closeSession(session, state, complete, { correctCount, wrongCount,
+        rewardSunCount, rewardSunValue, challengeRule: session.challengeRule });
+      if (!finalResult) return { learningSessionId: session.sessionId,
+        ...(session.saveId ? { saveId: session.saveId } : {}), correctCount, questionCount,
+        reward: { grantId: "unconfirmed", sunCount: 0 }, completed: false,
+        cancelled: state.cancelled || lifecycle.stopped(), ...(state.suspended ? { suspended: true } : {}),
+        ...(state.reason ? { reason: state.reason } : {}) };
+      return { learningSessionId: session.sessionId, ...(session.saveId ? { saveId: session.saveId } : {}),
+        correctCount: finalResult.final.correctCount, questionCount: finalResult.final.questionCount,
+        wrongCount: finalResult.final.wrongCount, reward: finalResult.final.reward,
+        challenge: finalResult.final.challenge, completed: complete && !state.cancelled && !lifecycle.stopped(),
+        cancelled: state.cancelled || lifecycle.stopped(),
+        ...(state.reason ? { reason: state.reason } : {}) };
     } finally {
-      if (ownsPause) {
-        try { bridge.releasePause(snapshot); } catch (error) { report("Failed to release quiz pause", error); }
-      }
-      if (activeAttempt === attempt) activeAttempt = null;
-      if (activeRun === run) {
-        activeRun = null;
-        busy = false;
-      }
-      if (runGeneration === lifecycleGeneration) {
-        elapsed = 0;
-        delay = entry?.pendingTask ? 0 : repeatDelayMs;
-        lastNow = null;
-      }
+      view.dismiss(state.reason ?? "completed");
     }
   }
 
-  async function tick(now) {
-    if (stopped) return;
-    const nextIdentity = bridge.getLevelIdentity();
-    if (nextIdentity !== identity) await changeIdentity(nextIdentity);
-    if (nextIdentity !== identity || nextIdentity !== bridge.getLevelIdentity()) return;
-    if (busy) {
-      if (activeAttempt && (!bridge.isCurrent(activeAttempt.snapshot) ||
-        (view.isOpen() && !bridge.isQuizActive(activeAttempt.snapshot)))) invalidate("scene_changed");
-      lastNow = now;
-      return;
-    }
-    if (!nextIdentity || !visible || !isVisible() || !bridge.isEligible()) { lastNow = now; return; }
-    if (lifecycle?.pendingTask) { await runQuiz(nextIdentity); return; }
-    if (lastNow === null) { lastNow = now; return; }
-    elapsed += Math.min(Math.max(now - lastNow, 0), maxDeltaMs);
-    lastNow = now;
-    if (elapsed >= delay && !lifecycle?.ended) await runQuiz(nextIdentity);
+  function run(gameContext) {
+    return lifecycle.run(execute, gameContext);
   }
 
-  function setVisible(nextVisible) {
-    visible = Boolean(nextVisible);
-    lastNow = null;
-    if (!nextVisible) { elapsed = 0; invalidate("hidden"); }
-  }
-
-  async function stop() {
-    if (stopped) return lifecycle?.closePromise;
-    stopped = true;
-    invalidate("stopped");
-    return endLifecycle(lifecycle, "stopped");
-  }
-
-  return { tick, setVisible, stop };
+  return { run, setVisible: lifecycle.setVisible, stop: lifecycle.stop, suspend: lifecycle.suspend };
 }
