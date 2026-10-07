@@ -54,6 +54,7 @@
   background: transparent;
   font-family: "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", system-ui, sans-serif;
   text-align: center;
+  -webkit-user-select: none;
   user-select: none;
 }
 #addition-quiz, #addition-quiz * { box-sizing: border-box; }

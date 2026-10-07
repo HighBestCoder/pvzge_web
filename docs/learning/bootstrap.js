@@ -1,3 +1,4 @@
+import "./compat.js";
 import { createGameBridge } from "./game-bridge.js";
 import { createGameReporter } from "./game-reporter.js";
 import { handleAuthorizationFailure } from "./authorization-failure.js";
