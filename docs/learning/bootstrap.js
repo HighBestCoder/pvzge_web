@@ -7,6 +7,7 @@ import { PickerRedirectError, prepareGameContext } from "./game-prepare.js";
 import { createLevelEntry } from "./level-entry.js";
 import { createLocalLearningProvider } from "./local-provider.js";
 import { installMusicStreaming, isAppleMobile } from "./music-streaming.js";
+import { installTouchAsMouse } from "./touch-mouse.js";
 import { createNativeProfileBinding } from "./native-profile.js";
 import { createNativeStart } from "./native-start.js";
 import { createNativeStateSync } from "./native-state.js";
@@ -25,6 +26,7 @@ let nativeProfile = null;
 let nativeStart = null;
 let context = null;
 let musicStreaming = null;
+let touchAsMouse = null;
 
 function cached(id) { try { return globalThis.System?.get?.(globalThis.System.resolve(id)); } catch { return null; } }
 
@@ -58,10 +60,18 @@ function waitForHookTargets() {
   });
 }
 
+// iPad/iPhone-only adaptations. Each is optional: a failure is logged and the game still starts.
+function installAppleMobileFixes(cc) {
+  try { musicStreaming ??= installMusicStreaming({ AudioClip: cc.AudioClip, bundle: cc.resources }); }
+  catch (error) { console.error("[quiz] Music streaming unavailable", error); }
+  try {
+    touchAsMouse ??= installTouchAsMouse({ canvas: document.getElementById("GameCanvas"),
+      touchInput: cc.input?._touchInput });
+  } catch (error) { console.error("[quiz] Touch-as-mouse unavailable", error); }
+}
+
 async function installHook({ keys, level, MainScene, player, cc }) {
-  if (!musicStreaming && isAppleMobile()) {
-    musicStreaming = installMusicStreaming({ AudioClip: cc.AudioClip, bundle: cc.resources });
-  }
+  if (isAppleMobile()) installAppleMobileFixes(cc);
   const provider = context.demo ? createLocalLearningProvider({ learnerRef: "demo-learner" })
     : createRemoteLearningProvider({ saveId: context.saveId });
   const controller = createQuizController({ provider, view: createQuizView() });
