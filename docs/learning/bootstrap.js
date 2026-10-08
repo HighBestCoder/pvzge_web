@@ -6,6 +6,7 @@ import { createBootstrapLifecycle, createPagehideHandler } from "./bootstrap-lif
 import { PickerRedirectError, prepareGameContext } from "./game-prepare.js";
 import { createLevelEntry } from "./level-entry.js";
 import { createLocalLearningProvider } from "./local-provider.js";
+import { installMusicStreaming, isAppleMobile } from "./music-streaming.js";
 import { createNativeProfileBinding } from "./native-profile.js";
 import { createNativeStart } from "./native-start.js";
 import { createNativeStateSync } from "./native-state.js";
@@ -23,6 +24,7 @@ let entry = null;
 let nativeProfile = null;
 let nativeStart = null;
 let context = null;
+let musicStreaming = null;
 
 function cached(id) { try { return globalThis.System?.get?.(globalThis.System.resolve(id)); } catch { return null; } }
 
@@ -57,6 +59,9 @@ function waitForHookTargets() {
 }
 
 async function installHook({ keys, level, MainScene, player, cc }) {
+  if (!musicStreaming && isAppleMobile()) {
+    musicStreaming = installMusicStreaming({ AudioClip: cc.AudioClip, bundle: cc.resources });
+  }
   const provider = context.demo ? createLocalLearningProvider({ learnerRef: "demo-learner" })
     : createRemoteLearningProvider({ saveId: context.saveId });
   const controller = createQuizController({ provider, view: createQuizView() });
