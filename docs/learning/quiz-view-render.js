@@ -14,6 +14,13 @@ function isStoryPrompt(text) {
   return text.includes("\n") || text.length > STORY_PROMPT_LENGTH;
 }
 
+// Limits can be up to 20 minutes, so show minutes once a minute or more is left ("剩余19分05秒").
+export function formatRemaining(remainingMs) {
+  const seconds = Math.max(0, Math.ceil(remainingMs / 1_000));
+  if (seconds < 60) return `剩余${seconds}秒`;
+  return `剩余${Math.floor(seconds / 60)}分${String(seconds % 60).padStart(2, "0")}秒`;
+}
+
 function createPrompt(question) {
   const prompt = element("div", "quiz-view__prompt");
   prompt.id = PROMPT_ID;
@@ -31,7 +38,7 @@ function createPrompt(question) {
 
 function createTiming(question, isFinal) {
   const timing = element("div", "quiz-view__timing");
-  const timer = element("p", "quiz-view__timer", `剩余${Math.ceil(question.timeLimitMs / 1_000)}秒`);
+  const timer = element("p", "quiz-view__timer", formatRemaining(question.timeLimitMs));
   timer.id = "addition-quiz-timer";
   timer.setAttribute("role", "timer");
   timer.setAttribute("aria-live", "off");
@@ -101,7 +108,7 @@ export function renderQuestion({ question, progress, resolveIntent, state }) {
     onSettle: (value) => state.settleIntent(source, value),
     onUpdate: (remainingMs) => {
       if (state.isActive(source) && source.kind === "question") {
-        timer.textContent = `剩余${Math.ceil(remainingMs / 1_000)}秒`;
+        timer.textContent = formatRemaining(remainingMs);
       }
     } });
 }
