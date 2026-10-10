@@ -284,12 +284,71 @@ export function parseEndSessionResult(input) {
   };
 }
 
+function boundedList(value, path, minimum, maximum, parseItem) {
+  if (!Array.isArray(value) || value.length < minimum || value.length > maximum) {
+    invalid(path, `must be an array of ${minimum}-${maximum} items`);
+  }
+  return value.map((item, index) => parseItem(item, `${path}[${index}]`));
+}
+
+function figureCaption(figure, path) {
+  return figure.caption === undefined ? {} : { caption: boundedString(figure.caption, `${path}.caption`, 80) };
+}
+
+// Optional drawing data next to the prompt (see learning-platform figure_models.py). Limits mirror
+// the server so a malformed figure is rejected rather than drawn half-way.
+function parseFigure(input, path) {
+  const figure = object(input, path);
+  const type = oneOf(figure.type, ["sequence", "rows", "order", "grid"], `${path}.type`);
+  const token = (value, itemPath) => boundedString(value, itemPath, 8);
+  const label = (value, itemPath) => boundedString(value, itemPath, 12);
+  if (type === "sequence") {
+    exactKeys(figure, ["type", "items", "repeat", "caption"], path);
+    return { type, items: boundedList(figure.items, `${path}.items`, 1, 12, token),
+      repeat: figure.repeat === undefined ? 2 : integer(figure.repeat, `${path}.repeat`, 1, 4),
+      ...figureCaption(figure, path) };
+  }
+  if (type === "rows") {
+    exactKeys(figure, ["type", "rows", "columns", "caption"], path);
+    return { type, columns: integer(figure.columns, `${path}.columns`, 2, 16),
+      rows: boundedList(figure.rows, `${path}.rows`, 1, 3, (row, rowPath) => {
+        object(row, rowPath);
+        exactKeys(row, ["label", "pattern"], rowPath);
+        return { label: label(row.label, `${rowPath}.label`),
+          pattern: boundedList(row.pattern, `${rowPath}.pattern`, 1, 12, token) };
+      }), ...figureCaption(figure, path) };
+  }
+  if (type === "order") {
+    exactKeys(figure, ["type", "lanes", "sequence", "caption"], path);
+    const lanes = boundedList(figure.lanes, `${path}.lanes`, 2, 8, label);
+    const sequence = boundedList(figure.sequence, `${path}.sequence`, 2, 16, label);
+    if (new Set(lanes).size !== lanes.length) invalid(`${path}.lanes`, "must be unique");
+    if (sequence.some((step) => !lanes.includes(step))) invalid(`${path}.sequence`, "must use declared lanes");
+    return { type, lanes, sequence, ...figureCaption(figure, path) };
+  }
+  exactKeys(figure, ["type", "header", "rowLabels", "cells", "caption"], path);
+  const cell = (value, cellPath) => {
+    if (typeof value !== "string" || value.length > 8) invalid(cellPath, "must be a string of at most 8 characters");
+    return value;
+  };
+  const cells = boundedList(figure.cells, `${path}.cells`, 1, 8,
+    (row, rowPath) => boundedList(row, rowPath, 1, 8, cell));
+  if (cells.some((row) => row.length !== cells[0].length)) invalid(`${path}.cells`, "rows must have equal length");
+  const header = figure.header === undefined ? undefined : boundedList(figure.header, `${path}.header`, 1, 8, label);
+  const rowLabels = figure.rowLabels === undefined ? undefined
+    : boundedList(figure.rowLabels, `${path}.rowLabels`, 1, 8, label);
+  if (header && header.length !== cells[0].length) invalid(`${path}.header`, "must match grid width");
+  if (rowLabels && rowLabels.length !== cells.length) invalid(`${path}.rowLabels`, "must match grid height");
+  return { type, cells, ...(header ? { header } : {}), ...(rowLabels ? { rowLabels } : {}),
+    ...figureCaption(figure, path) };
+}
+
 export function parseTask(input) {
   const value = object(input, "task");
   exactKeys(value, ["taskId", "questionId", "questionVersion", "kind", "content", "options",
     "inputSpec", "metadata", "timeLimitMs"], "task");
   const content = object(value.content, "task.content");
-  exactKeys(content, ["format", "prompt"], "task.content");
+  exactKeys(content, ["format", "prompt", "figure"], "task.content");
   const metadata = object(value.metadata, "task.metadata");
   exactKeys(metadata, ["subjectId", "skillIds", "tableId", "stageKey", "direction", "labels"], "task.metadata");
   const kind = oneOf(value.kind, ["single_choice", "numeric_entry"], "task.kind");
@@ -321,6 +380,7 @@ export function parseTask(input) {
     content: {
       format: literal(content.format, "plain_text", "task.content.format"),
       prompt: string(content.prompt, "task.content.prompt"),
+      ...(content.figure === undefined ? {} : { figure: parseFigure(content.figure, "task.content.figure") }),
     },
     ...(kind === "single_choice" ? { options } : { inputSpec: parseInputSpec(value.inputSpec) }),
     metadata: {

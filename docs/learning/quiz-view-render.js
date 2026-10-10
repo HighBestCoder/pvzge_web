@@ -2,9 +2,17 @@ import { createTimedAttempt } from "./timed-attempt.js";
 import { createSolutionPane } from "./quiz-feedback.js";
 import { element, prepareDialog } from "./quiz-view-elements.js";
 import { createNumericInput } from "./quiz-input.js";
+import { createFigure } from "./quiz-figure.js";
 
 const PROMPT_ID = "addition-quiz-prompt";
 const TIMEOUT_ID = "addition-quiz-timeout";
+
+// Word problems (long, or laid out over several lines) read better smaller than a bare equation;
+// at equation size their rows wrap mid-line and push the options off screen.
+const STORY_PROMPT_LENGTH = 30;
+function isStoryPrompt(text) {
+  return text.includes("\n") || text.length > STORY_PROMPT_LENGTH;
+}
 
 function createPrompt(question) {
   const prompt = element("div", "quiz-view__prompt");
@@ -12,9 +20,12 @@ function createPrompt(question) {
   prompt.append(
     element("p", "quiz-view__instruction", question.kind === "numeric_entry"
       ? "填写答案并提交后，可查看题解" : "选择答案后可查看正确答案和题解"),
-    element("p", "quiz-view__equation", question.content.prompt),
+    element("p", isStoryPrompt(question.content.prompt)
+      ? "quiz-view__equation quiz-view__equation--story" : "quiz-view__equation", question.content.prompt),
   );
   prompt.lastElementChild.dataset.testid = "quiz-equation";
+  const figure = question.content.figure ? createFigure(question.content.figure) : null;
+  if (figure) prompt.append(figure);
   return prompt;
 }
 

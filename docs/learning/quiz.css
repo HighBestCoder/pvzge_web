@@ -39,6 +39,7 @@
   --quiz-type-title: clamp(1.5rem, 5vw, 2rem);
   --quiz-type-equation: clamp(2rem, 9vw, 3rem);
   --quiz-type-equation-landscape: 2rem;
+  --quiz-type-story: clamp(1.125rem, 3.4vw, 1.375rem);
   --quiz-type-button: clamp(1rem, 3.6vw, 1.25rem);
   --quiz-type-body: 1rem;
   --quiz-type-caption: 0.875rem;
@@ -181,7 +182,8 @@
   font-size: var(--quiz-type-equation);
   font-weight: 900;
   line-height: 1.1;
-  white-space: normal;
+  /* Keep author line breaks so row/column puzzles can show each row on its own line. */
+  white-space: pre-line;
   overflow-wrap: anywhere;
 }
 #addition-quiz .quiz-view__timing {
@@ -286,3 +288,12 @@
     align-self: center; padding: var(--quiz-space-4); font-size: var(--quiz-type-button);
   }
 } @media (prefers-reduced-motion: reduce) { #addition-quiz[open] { animation: none; } #addition-quiz .quiz-view__button { transition: none; } }
+
+/* Word problems: smaller type so each laid-out row stays on one line and the options stay in view. */
+#addition-quiz .quiz-view__equation.quiz-view__equation--story,
+#addition-quiz.quiz-view--question .quiz-view__equation.quiz-view__equation--story {
+  font-size: var(--quiz-type-story);
+  font-weight: 800;
+  line-height: 1.6;
+  text-align: start;
+}
