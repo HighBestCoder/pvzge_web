@@ -20,6 +20,15 @@ export function createLevelEntry({ keyListener, levelPlay, getPlayer, controller
   let installed = false;
   let stopped = false;
 
+  async function returnToMenu() {
+    if (typeof keyListener.GoToMain !== "function") {
+      log.error("[quiz] KeyListener.GoToMain is unavailable; cannot return to the main menu");
+      return;
+    }
+    try { await Reflect.apply(keyListener.GoToMain, keyListener, []); }
+    catch (error) { log.error("[quiz] Returning to the main menu failed", error); }
+  }
+
   function target(snapshot) {
     const ids = Array.isArray(snapshot.thisLevelsID) ? snapshot.thisLevelsID : [snapshot.thisLevelsID];
     const serialized = ids.filter((value) => value !== null && value !== undefined && String(value).length > 0).map(String);
@@ -42,8 +51,13 @@ export function createLevelEntry({ keyListener, levelPlay, getPlayer, controller
       result = await controller.run({ gameId: "pvzge", levelIds, locale: "zh-CN" });
       if (result.completed && snapshot.player) entitlements.set(snapshot.player, { key, result });
     }
-    if (stopped || snapshot.player !== (getPlayer?.() ?? null) ||
-      (!result.completed && result.reason !== "user")) return undefined;
+    if (stopped || snapshot.player !== (getPlayer?.() ?? null)) return undefined;
+    if (!result.completed) {
+      // The game only starts after a round reaches the unlock accuracy. Leaving the quiz ("返回主菜单")
+      // must not strand the player on the darkened loading screen, so go back to the main menu.
+      if (result.reason === "user") await returnToMenu();
+      return undefined;
+    }
     restoreLevelState(levelPlay, snapshot);
     const token = {};
     targetToken = token;

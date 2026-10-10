@@ -1,5 +1,6 @@
 import { createAdditionQuestion } from "./question.js";
 import { LearningProviderError, parseSession, parseSubmissionResult, parseTaskResponse } from "./provider.js";
+import { meetsGameUnlock } from "./quiz-config.js";
 import {
   parseCreateSessionRequest,
   parseEndSessionRequest,
@@ -179,7 +180,9 @@ export function createLocalLearningProvider({
         final: { correctCount: session.correctCount, wrongCount: session.wrongCount,
           questionCount: QUESTION_COUNT,
           passed: session.correctCount >= 8,
-          reward: { grantId: `local-${request.sessionId}`, sunCount: session.correctCount * 5 },
+          gameUnlocked: meetsGameUnlock(session.correctCount, QUESTION_COUNT),
+          reward: { grantId: `local-${request.sessionId}`,
+            sunCount: meetsGameUnlock(session.correctCount, QUESTION_COUNT) ? session.correctCount * 5 : 0 },
           challenge: { enabled: false, ruleVersion: 0, extraPerWave: 0, maxWaves: 3,
             totalCap: 6 } } };
     });

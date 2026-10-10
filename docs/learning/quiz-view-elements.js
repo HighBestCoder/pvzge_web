@@ -27,7 +27,7 @@ export function formatProgressSummary(progress) {
     ? progress.rewardSunCount : progress.correctCount * SUNS_PER_CORRECT;
   const rewardSunValue = Number.isSafeInteger(progress.rewardSunValue)
     ? progress.rewardSunValue : rewardSunCount * 50;
-  return `已答对${progress.correctCount}题 · 累计奖励${rewardSunCount}个阳光（${rewardSunValue}点）`;
+  return `已答对${progress.correctCount}题 · 达标后可得${rewardSunCount}个阳光（${rewardSunValue}点）`;
 }
 
 export function updateProgress(dialog, progress) {

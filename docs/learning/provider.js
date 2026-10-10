@@ -1,3 +1,5 @@
+import { meetsGameUnlock } from "./quiz-config.js";
+
 export class LearningProviderError extends Error {
   constructor(code, message, status = null) {
     super(message);
@@ -273,6 +275,9 @@ export function parseEndSessionResult(input) {
     final: {
       correctCount, wrongCount, questionCount,
       passed: boolean(final.passed, "final.passed"),
+      // Older servers omit gameUnlocked; fall back to the same accuracy rule.
+      gameUnlocked: final.gameUnlocked === undefined
+        ? meetsGameUnlock(correctCount, questionCount) : boolean(final.gameUnlocked, "final.gameUnlocked"),
       reward: { grantId: string(reward.grantId, "final.reward.grantId"), sunCount: integer(reward.sunCount, "final.reward.sunCount") },
       challenge: finalChallenge(final.challenge),
     },

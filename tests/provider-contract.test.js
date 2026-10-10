@@ -170,4 +170,14 @@ describe("provider DTO parsing", () => {
       expect(() => parseTaskResponse(invalid)).toThrow(LearningProviderError);
     }
   });
+
+  test("reads the server's gameUnlocked and falls back to the 90% rule when it is absent", () => {
+    const ended = (final) => parseEndSessionResult({ schemaVersion: 1, status: "ended", sessionId: "s",
+      final: { wrongCount: 0, passed: true, reward: { grantId: "g", sunCount: 0 }, ...final } });
+    expect(ended({ correctCount: 8, questionCount: 10, gameUnlocked: true }).final.gameUnlocked).toBe(true);
+    expect(ended({ correctCount: 10, questionCount: 10, gameUnlocked: false }).final.gameUnlocked).toBe(false);
+    expect(ended({ correctCount: 9, questionCount: 10 }).final.gameUnlocked).toBe(true);
+    expect(ended({ correctCount: 8, questionCount: 10 }).final.gameUnlocked).toBe(false);
+    expect(() => ended({ correctCount: 9, questionCount: 10, gameUnlocked: "yes" })).toThrow(LearningProviderError);
+  });
 });

@@ -13,14 +13,16 @@ function harness(run = async () => ({ correctCount: 2, questionCount: 3, reward:
   const rewards = [];
   const player = {};
   const levelPlay = { thisLevelsID: [1, 2], nextLevelsID: [3], levelData: { name: "native" }, rhythmMusicClip: {} };
-  const keyListener = { marker: "owner", async GoToGame(...args) { calls.push({ self: this, args }); return "loaded"; } };
+  const menus = [];
+  const keyListener = { marker: "owner", async GoToGame(...args) { calls.push({ self: this, args }); return "loaded"; },
+    async GoToMain() { menus.push(this); } };
   const lifecycle = [];
   const controller = { run, stop() { lifecycle.push("stop"); }, suspend() { lifecycle.push("suspend"); } };
   const bridge = { cancelPending() {}, watchReward(input) { rewards.push(input); return Promise.resolve(); }, snapshotRuntime: () => ({ scene: {}, identity: {} }) };
   const entry = createLevelEntry({ keyListener, levelPlay, getPlayer: () => player, controller, bridge,
     log: { error() {}, warn() {} } });
   entry.install();
-  return { bridge, calls, controller, entry, keyListener, levelPlay, lifecycle, player, rewards };
+  return { bridge, calls, controller, entry, keyListener, levelPlay, lifecycle, menus, player, rewards };
 }
 
 describe("GoToGame level-entry gate", () => {
@@ -104,13 +106,26 @@ describe("GoToGame level-entry gate", () => {
     expect(h.rewards.map((input) => input.challenge)).toEqual([challenge, challenge]);
   });
 
-  test("cancel launches once but stop never invokes native loading", async () => {
+  test("leaving the quiz returns to the main menu instead of starting the level", async () => {
     const cancelled = harness(async () => ({ correctCount: 0, completed: false, cancelled: true, reason: "user" }));
     await cancelled.keyListener.GoToGame([[{}]], false);
-    expect(cancelled.calls).toHaveLength(1);
+    expect(cancelled.calls).toHaveLength(0);
+    expect(cancelled.menus).toEqual([cancelled.keyListener]);
+    expect(cancelled.rewards).toHaveLength(0);
+  });
+
+  test("stop never invokes native loading or the main menu", async () => {
     const stopped = harness(async () => ({ correctCount: 0, completed: false, cancelled: true, reason: "stopped" }));
     await stopped.keyListener.GoToGame([[{}]], false);
     expect(stopped.calls).toHaveLength(0);
+    expect(stopped.menus).toHaveLength(0);
+  });
+
+  test("a missing GoToMain is logged instead of breaking the transition", async () => {
+    const h = harness(async () => ({ correctCount: 0, completed: false, cancelled: true, reason: "user" }));
+    delete h.keyListener.GoToMain;
+    await expect(h.keyListener.GoToGame([[{}]], false)).resolves.toBeUndefined();
+    expect(h.calls).toHaveLength(0);
   });
 
   test("page teardown suspends the controller without explicit terminal stop", () => {

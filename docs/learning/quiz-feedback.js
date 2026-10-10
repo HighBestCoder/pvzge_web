@@ -46,7 +46,7 @@ export function showSolutionLoading(pane, message, { onCancel, onRetry } = {}) {
     actions.append(retry);
   }
   if (onCancel) {
-    const cancel = element("button", "quiz-view__skip quiz-view__cancel", "取消练习并开始游戏");
+    const cancel = element("button", "quiz-view__skip quiz-view__cancel", "返回主菜单");
     cancel.type = "button";
     cancel.addEventListener("click", onCancel, { once: true });
     actions.append(cancel);
@@ -89,7 +89,7 @@ export function showSolutionResult(pane, result, isFinal, onNext) {
   status.append(element("p", "quiz-solution__explanation",
     feedback?.explanation ?? FALLBACK_EXPLANATION));
   const next = element("button", "quiz-view__button quiz-solution__next",
-    isFinal ? "开始游戏" : "下一题");
+    isFinal ? "完成本轮" : "下一题");
   next.type = "button";
   next.dataset.testid = "quiz-next";
   next.addEventListener("click", onNext, { once: true });

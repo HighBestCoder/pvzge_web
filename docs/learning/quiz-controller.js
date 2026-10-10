@@ -1,5 +1,6 @@
 import { callProvider, createRequestFactory, PROVIDER_TIMEOUT_MS } from "./learning-session.js";
 import { parseEndSessionResult, parseSession, parseSubmissionResult, parseTaskResponse } from "./provider.js";
+import { requiredCorrect } from "./quiz-config.js";
 import { createQuizControllerLifecycle } from "./quiz-controller-lifecycle.js";
 
 function validIntent(value, task) {
@@ -62,7 +63,7 @@ export function createQuizController({
         message: "正在确认学习奖励" }, state, parse);
   }
 
-  async function execute(gameContext, state) {
+  async function executeRound(gameContext, state) {
     let session = null;
     let correctCount = 0;
     let wrongCount = 0;
@@ -166,11 +167,35 @@ export function createQuizController({
       return { learningSessionId: session.sessionId, ...(session.saveId ? { saveId: session.saveId } : {}),
         correctCount: finalResult.final.correctCount, questionCount: finalResult.final.questionCount,
         wrongCount: finalResult.final.wrongCount, reward: finalResult.final.reward,
-        challenge: finalResult.final.challenge, completed: complete && !state.cancelled && !lifecycle.stopped(),
+        challenge: finalResult.final.challenge, gameUnlocked: finalResult.final.gameUnlocked,
+        completed: complete && !state.cancelled && !lifecycle.stopped(),
         cancelled: state.cancelled || lifecycle.stopped(),
         ...(state.reason ? { reason: state.reason } : {}) };
     } finally {
       view.dismiss(state.reason ?? "completed");
+    }
+  }
+
+  // Rounds repeat until one reaches the unlock accuracy; only that round's reward reaches the game.
+  // Leaving from the retry card ends with reason "user", which sends the player back to the menu.
+  async function execute(gameContext, state) {
+    for (;;) {
+      const round = await executeRound(gameContext, state);
+      if (!round.completed || round.gameUnlocked || lifecycle.terminal(state)) return round;
+      const summary = { correctCount: round.correctCount, questionCount: round.questionCount,
+        requiredCount: requiredCorrect(round.questionCount) };
+      const progress = { current: round.questionCount, total: round.questionCount,
+        correctCount: round.correctCount, wrongCount: round.wrongCount };
+      let action = null;
+      do {
+        if (!lifecycle.available()) await lifecycle.waitUntilVisible(state);
+        if (lifecycle.terminal(state)) break;
+        action = await view.showRetry(summary, progress, { onCancel: () => lifecycle.cancel("user") });
+      } while (action?.action === "dismissed" && action.reason === "hidden" && !lifecycle.terminal(state));
+      if (lifecycle.terminal(state)) {
+        return { ...round, completed: false, cancelled: true, ...(state.reason ? { reason: state.reason } : {}) };
+      }
+      if (action?.action !== "retry") throw new TypeError("Quiz view returned an invalid retry intent");
     }
   }
 

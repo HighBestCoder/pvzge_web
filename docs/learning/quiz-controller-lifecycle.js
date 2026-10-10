@@ -1,7 +1,7 @@
 import { callProvider } from "./learning-session.js";
 
-const ERROR_MESSAGE = "学习服务暂不可用，可取消练习进入游戏";
-const CONFIG_ERROR_MESSAGE = "此关卡尚未配置题库，请前往题库管理；可重试或取消后以 0 奖励进入游戏";
+const ERROR_MESSAGE = "学习服务暂不可用，可重试或返回主菜单";
+const CONFIG_ERROR_MESSAGE = "此关卡尚未配置题库，请前往题库管理；可重试或返回主菜单";
 
 export function createQuizControllerLifecycle({ view, isVisible, timeoutMs, log }) {
   let active = null;

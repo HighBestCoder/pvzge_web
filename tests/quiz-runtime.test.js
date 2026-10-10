@@ -20,18 +20,24 @@ function deferred() {
 
 function harness({ answers = [], tasks = [task(1), task(2), task(3)], submitHook,
   showResult, questionCount = tasks.length, completedCount = 0, correctCount = 0, wrongCount = 0,
-  challengeRule = { enabled: false, version: 0, perWaveCap: 2, maxWaves: 3, totalCap: 6 } } = {}) {
+  challengeRule = { enabled: false, version: 0, perWaveCap: 2, maxWaves: 3, totalCap: 6 },
+  unlocks = [], retryActions = [] } = {}) {
   const requests = { create: [], next: [], submit: [], end: [] };
   const loading = [];
   const progress = [];
   const feedback = [];
   const dismissals = [];
+  const retries = [];
   let next = 0;
+  let roundSubmits = 0;
   let providerCorrect = correctCount;
   let visible = true;
   const provider = {
     async createSession(request) {
       requests.create.push(structuredClone(request));
+      next = 0;
+      roundSubmits = 0;
+      providerCorrect = correctCount;
       return { schemaVersion: 1, status: "active", sessionId: "session-1", learnerRef: "learner",
         plan: { planId: "plan", title: "Plan", subjectId: "math", skillIds: ["addition"] },
         questionCount, completedCount, correctCount, wrongCount, challengeRule,
@@ -44,6 +50,7 @@ function harness({ answers = [], tasks = [task(1), task(2), task(3)], submitHook
     },
     async submitAnswer(request) {
       requests.submit.push(structuredClone(request));
+      roundSubmits += 1;
       const result = submitHook ? await submitHook(request, requests.submit.length) : {
         schemaVersion: 1, status: request.response.type === "answered" ? "graded" : "recorded",
         sessionId: request.sessionId, taskId: request.taskId, questionId: request.questionId,
@@ -52,7 +59,7 @@ function harness({ answers = [], tasks = [task(1), task(2), task(3)], submitHook
       if (result.status === "graded" && result.correctness === "correct" && result.taskId === request.taskId) providerCorrect += 1;
       result.progress ??= { correctCount: providerCorrect,
         wrongCount: result.status === "graded" && result.correctness === "incorrect" ? wrongCount + 1 : wrongCount,
-        completedCount: completedCount + requests.submit.length,
+        completedCount: completedCount + roundSubmits,
         rewardSunCount: providerCorrect * 5, rewardSunValue: providerCorrect * 250 };
       providerCorrect = result.progress.correctCount;
       return result;
@@ -61,7 +68,8 @@ function harness({ answers = [], tasks = [task(1), task(2), task(3)], submitHook
       requests.end.push(structuredClone(request));
       return { schemaVersion: 1, status: "ended", sessionId: request.sessionId,
         final: { correctCount: providerCorrect, wrongCount, questionCount, passed: false,
-          reward: { grantId: "grant-1", sunCount: providerCorrect * 5 },
+          gameUnlocked: unlocks[requests.end.length - 1] ?? true,
+          reward: { grantId: `grant-${requests.end.length}`, sunCount: providerCorrect * 5 },
           challenge: { enabled: challengeRule.enabled, ruleVersion: challengeRule.version,
             extraPerWave: challengeRule.enabled ? Math.min(wrongCount, challengeRule.perWaveCap) : 0,
             maxWaves: challengeRule.maxWaves, totalCap: challengeRule.totalCap } } };
@@ -78,12 +86,18 @@ function harness({ answers = [], tasks = [task(1), task(2), task(3)], submitHook
       if (showResult) await showResult(result, currentProgress);
       return { action: "next" };
     },
+    async showRetry(summary, currentProgress, options) {
+      retries.push(structuredClone({ summary, progress: currentProgress }));
+      const action = retryActions[retries.length - 1] ?? "retry";
+      if (action === "cancel") { options.onCancel(); return { action: "dismissed", reason: "user" }; }
+      return { action };
+    },
     dismiss(reason) { dismissals.push(reason); },
   };
   let serial = 0;
   const controller = createQuizController({ provider, view, isVisible: () => visible,
     id: () => `id-${++serial}`, log: { error() {} } });
-  return { controller, dismissals, feedback, loading, progress, requests,
+  return { controller, dismissals, feedback, loading, progress, requests, retries,
     setVisible(value) { visible = value; controller.setVisible(value); } };
 }
 
@@ -91,7 +105,7 @@ describe("pre-level quiz batch", () => {
   test("defaults progress to the ten-question batch", () => {
     expect(normalizeProgress()).toEqual({ current: 1, total: 10, correctCount: 0,
       challengeRule: null, message: undefined });
-    expect(formatProgressSummary({ correctCount: 3 })).toBe("已答对3题 · 累计奖励15个阳光（750点）");
+    expect(formatProgressSummary({ correctCount: 3 })).toBe("已答对3题 · 达标后可得15个阳光（750点）");
   });
 
   test("uses server-confirmed progress for feedback and forwards the final challenge", async () => {
@@ -255,7 +269,7 @@ describe("pre-level quiz batch", () => {
     expect(h.feedback).toHaveLength(0);
     expect(h.loading.some(({ progress }) => progress.message === "正在判题")).toBe(true);
     expect(h.loading.findLast(({ options }) => options.onRetry).progress.message)
-      .toBe("学习服务暂不可用，可取消练习进入游戏");
+      .toBe("学习服务暂不可用，可重试或返回主菜单");
     h.loading.findLast(({ options }) => options.onRetry).options.onRetry();
     while (h.feedback.length === 0) await Promise.resolve();
     expect(h.feedback[0].result.correctness).toBe("correct");
@@ -418,7 +432,8 @@ describe("pre-level quiz batch", () => {
       getNextTask: async () => ({ schemaVersion: 1, status: "no_task" }),
       submitAnswer() {},
       endSession: async request => ({ schemaVersion: 1, status: "ended", sessionId: request.sessionId,
-        final: { correctCount: 0, questionCount: 1, passed: false, reward: { grantId: "g", sunCount: 0 } } }),
+        final: { correctCount: 0, questionCount: 1, passed: false, gameUnlocked: true,
+          reward: { grantId: "g", sunCount: 0 } } }),
     };
     const controller = createQuizController({ provider, view: {
       ask() {}, dismiss() {}, showLoading(progress, options) { loading.push({ progress, options }); },
@@ -474,5 +489,52 @@ describe("pre-level quiz batch", () => {
     expect(requests.next).toHaveLength(1);
     expect(requests.submit).toHaveLength(1);
     expect(requests.end).toHaveLength(1);
+  });
+});
+
+describe("game unlocks only after a round reaches 90%", () => {
+  const right = (n) => Array.from({ length: n }, () => ({ type: "answered", optionId: "a", elapsedMs: 10 }));
+
+  test("a locked round shows the retry card, then a new round starts and only that round counts", async () => {
+    const { controller, requests, retries } = harness({ tasks: [task(1), task(2), task(3)],
+      answers: right(3), unlocks: [false, true] });
+
+    const result = await controller.run({ gameId: "pvzge", levelIds: ["1"], locale: "zh-CN" });
+
+    expect(requests.create).toHaveLength(2);
+    expect(requests.end).toHaveLength(2);
+    expect(retries).toHaveLength(1);
+    expect(retries[0].summary).toEqual({ correctCount: 3, questionCount: 3, requiredCount: 3 });
+    expect(result).toMatchObject({ completed: true, gameUnlocked: true,
+      reward: { grantId: "grant-2", sunCount: 15 } });
+  });
+
+  test("retries repeat with no limit until a round unlocks", async () => {
+    const { controller, requests, retries } = harness({ answers: right(3), unlocks: [false, false, false, true] });
+
+    const result = await controller.run({ gameId: "pvzge", levelIds: ["1"], locale: "zh-CN" });
+
+    expect(retries).toHaveLength(3);
+    expect(requests.create).toHaveLength(4);
+    expect(result).toMatchObject({ completed: true, gameUnlocked: true });
+  });
+
+  test("leaving from the retry card ends without the game and asks for the main menu", async () => {
+    const { controller, requests } = harness({ answers: right(3), unlocks: [false], retryActions: ["cancel"] });
+
+    const result = await controller.run({ gameId: "pvzge", levelIds: ["1"], locale: "zh-CN" });
+
+    expect(requests.create).toHaveLength(1);
+    expect(result).toMatchObject({ completed: false, cancelled: true, reason: "user" });
+  });
+
+  test("required correct answers round up from 90%", async () => {
+    const { requiredCorrect, meetsGameUnlock } = await import("../docs/learning/quiz-config.js");
+    expect([3, 5, 10, 12, 15].map(requiredCorrect)).toEqual([3, 5, 9, 11, 14]);
+    expect(meetsGameUnlock(9, 10)).toBe(true);
+    expect(meetsGameUnlock(8, 10)).toBe(false);
+    expect(meetsGameUnlock(14, 15)).toBe(true);
+    expect(meetsGameUnlock(13, 15)).toBe(false);
+    expect(meetsGameUnlock(0, 0)).toBe(false);
   });
 });

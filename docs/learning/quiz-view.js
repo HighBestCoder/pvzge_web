@@ -2,7 +2,7 @@ import QUESTION_DURATION_MS from "./timed-attempt.js";
 import { parseTask } from "./provider.js";
 import { normalizeProgress, updateProgress } from "./quiz-view-elements.js";
 import { showSolutionLoading, showSolutionResult } from "./quiz-feedback.js";
-import { renderLoading, renderQuestion, renderStageCard } from "./quiz-view-render.js";
+import { renderLoading, renderQuestion, renderRetry, renderStageCard } from "./quiz-view-render.js";
 import { createQuizViewState } from "./quiz-view-state.js";
 
 export function createQuizView() {
@@ -89,6 +89,15 @@ export function createQuizView() {
         state.release(source);
       });
       next.focus({ preventScroll: true });
+      return waiter.promise;
+    },
+
+    // Shown when a finished round is below the unlock accuracy. Resolves {action:"retry"}, or
+    // {action:"dismissed", reason} when hidden/cancelled; onCancel returns the player to the menu.
+    showRetry(summary, progressInput, { onCancel } = {}) {
+      state.replaceActive();
+      const waiter = Promise.withResolvers();
+      renderRetry({ summary, progress: normalizeProgress(progressInput), waiter, onCancel, state });
       return waiter.promise;
     },
 

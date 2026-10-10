@@ -25,7 +25,7 @@ function createTiming(question, isFinal) {
   timer.setAttribute("role", "timer");
   timer.setAttribute("aria-live", "off");
   const timeout = element("p", "quiz-view__timeout",
-    isFinal ? "超时后仍可阅读题解，再开始游戏" : "超时后仍可阅读题解，再进入下一题");
+    isFinal ? "超时后仍可阅读题解，再完成本轮" : "超时后仍可阅读题解，再进入下一题");
   timeout.id = TIMEOUT_ID;
   timing.append(timer, timeout);
   return { timing, timer };
@@ -123,6 +123,42 @@ export function renderStageCard({ card, progress, waiter, state }) {
   state.mount(source, ".quiz-stage-card__start");
 }
 
+export function renderRetry({ summary, progress, waiter, onCancel, state }) {
+  const { dialog, panel } = prepareDialog(progress, "retry");
+  // This round earned nothing, so the header must not promise its suns.
+  panel.querySelector('[data-testid="quiz-summary"]').textContent =
+    `已答对${summary.correctCount}题 · 本轮未达标，不发放阳光`;
+  const source = { kind: "retry", dialog, previousFocus: document.activeElement, cancel: onCancel,
+    intentSettled: true, continueWaiter: waiter };
+  const article = element("article", "quiz-retry");
+  const result = element("p", "quiz-retry__result",
+    `本轮答对 ${summary.correctCount}/${summary.questionCount} 题，至少答对 ${summary.requiredCount} 题才能开始游戏。`);
+  result.dataset.testid = "quiz-retry-result";
+  result.setAttribute("role", "status");
+  article.append(
+    element("h3", "quiz-retry__title", "还差一点点！"),
+    result,
+    element("p", "quiz-retry__hint", "再练一轮，你一定可以的！"),
+  );
+  const actions = element("div", "quiz-view__actions");
+  const again = element("button", "quiz-view__button quiz-retry__again", "再来一轮");
+  again.type = "button";
+  again.dataset.testid = "quiz-retry";
+  again.addEventListener("click", () => {
+    if (!state.isActive(source)) return;
+    state.settleContinue(source, { action: "retry" });
+    state.release(source);
+  }, { once: true });
+  const cancel = element("button", "quiz-view__skip quiz-view__cancel", "返回主菜单");
+  cancel.type = "button";
+  cancel.addEventListener("click", onCancel, { once: true });
+  actions.append(again, cancel);
+  article.append(actions);
+  panel.append(article);
+  state.guardDialog(source);
+  state.mount(source, ".quiz-retry__again");
+}
+
 export function renderLoading({ progress, options, state }) {
   const { dialog, panel } = prepareDialog(progress, "loading");
   const source = { kind: "loading", dialog, previousFocus: document.activeElement,
@@ -136,7 +172,7 @@ export function renderLoading({ progress, options, state }) {
     retry.addEventListener("click", options.onRetry, { once: true });
     actions.append(retry);
   }
-  const cancel = element("button", "quiz-view__skip quiz-view__cancel", "取消练习并开始游戏");
+  const cancel = element("button", "quiz-view__skip quiz-view__cancel", "返回主菜单");
   cancel.type = "button";
   cancel.addEventListener("click", options.onCancel, { once: true });
   actions.append(cancel);
